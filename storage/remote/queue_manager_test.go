@@ -577,3 +577,47 @@ func TestProcessExternalLabels(t *testing.T) {
 		testutil.Equals(t, tc.expected, processExternalLabels(tc.labels, tc.externalLabels))
 	}
 }
+
+func TestCalculateDesiredShards(t *testing.T) {
+	c := NewTestStorageClient()
+	cfg := config.DefaultQueueConfig
+
+	dir, err := ioutil.TempDir("", "TestSampleDeliver")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
+
+	samplesIn := newEWMARate(ewmaWeight, shardUpdateDuration)
+	m := NewQueueManager(nil, nil, dir, samplesIn, cfg, nil, nil, c, defaultFlushDeadline)
+
+	// Need to start the queue manager so the proper metrics are initialized.
+	// However we can stop it right away since we don't need to do any actual
+	// processing.
+	m.Start()
+	m.Stop()
+
+	inputRate := int64(50000)
+	var desiredShards int
+
+	// Two minute startup, no samples are sent.
+	m.startedAt = time.Now().Add(-2 * time.Minute)
+	for ts := time.Duration(0); ts < 120*time.Second; ts += shardUpdateDuration {
+		samplesIn.incr(inputRate * int64(shardUpdateDuration/time.Second))
+		samplesIn.tick()
+		desiredShards = m.calculateDesiredShards()
+		testutil.Equals(t, 1, desiredShards)
+	}
+
+	// Assume 100ms per request, or 10 requests per second per shard.
+	// Shard calculation should never drop below barely keeping up.
+	minShards := int(inputRate) / cfg.MaxSamplesPerSend / 10
+	for ts := time.Duration(0); ts < 10*time.Minute; ts += shardUpdateDuration {
+		samplesIn.incr(inputRate * int64(shardUpdateDuration/time.Second))
+		samplesIn.tick()
+		m.samplesOut.incr(int64(desiredShards*cfg.MaxSamplesPerSend) * int64(shardUpdateDuration/(100*time.Millisecond)))
+		m.samplesOutDuration.incr(int64(desiredShards) * int64(shardUpdateDuration))
+		atomic.StoreInt64(&m.lastSendTimestamp, time.Now().Unix())
+
+		desiredShards = m.calculateDesiredShards()
+		testutil.Assert(t, desiredShards >= minShards, "Shards are too low. desiredShards=%d, minShards=%d, t_seconds=%d", desiredShards, minShards, ts/time.Second)
+	}
+}
