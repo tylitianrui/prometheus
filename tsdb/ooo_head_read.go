@@ -111,7 +111,7 @@ func getOOOSeriesChunks(s *memSeries, mint, maxt int64, lastGarbageCollectedMmap
 					return nil
 				}
 				for _, chk := range chks {
-					addChunk(c.minTime, c.maxTime, ref, chk.chunk)
+					addChunk(chk.minTime, chk.maxTime, ref, chk.chunk)
 				}
 			} else {
 				var emptyChunk chunkenc.Chunk
@@ -586,15 +586,24 @@ func NewHeadAndOOOChunkQuerier(mint, maxt int64, head *Head, oooIsoState *oooIso
 }
 
 func (q *HeadAndOOOChunkQuerier) LabelValues(ctx context.Context, name string, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	if q.querier == nil {
+		return nil, nil, nil
+	}
 	return q.querier.LabelValues(ctx, name, hints, matchers...)
 }
 
 func (q *HeadAndOOOChunkQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	if q.querier == nil {
+		return nil, nil, nil
+	}
 	return q.querier.LabelNames(ctx, hints, matchers...)
 }
 
 func (q *HeadAndOOOChunkQuerier) Close() error {
 	q.chunkr.Close()
+	if q.querier == nil {
+		return nil
+	}
 	return q.querier.Close()
 }
 

@@ -150,6 +150,11 @@ type HeadOptions struct {
 	// EnableNativeHistograms enables the ingestion of native histograms.
 	EnableNativeHistograms atomic.Bool
 
+	// EnableOOONativeHistograms enables the ingestion of OOO native histograms.
+	// It will only take effect if EnableNativeHistograms is set to true and the
+	// OutOfOrderTimeWindow is > 0
+	EnableOOONativeHistograms atomic.Bool
+
 	// EnableCreatedTimestampZeroIngestion enables the ingestion of the created timestamp as a synthetic zero sample.
 	// See: https://github.com/prometheus/proposals/blob/main/proposals/2023-06-13_created-timestamp.md
 	EnableCreatedTimestampZeroIngestion bool
@@ -1016,6 +1021,16 @@ func (h *Head) EnableNativeHistograms() {
 // DisableNativeHistograms disables the native histogram feature.
 func (h *Head) DisableNativeHistograms() {
 	h.opts.EnableNativeHistograms.Store(false)
+}
+
+// EnableOOONativeHistograms enables the ingestion of out-of-order native histograms.
+func (h *Head) EnableOOONativeHistograms() {
+	h.opts.EnableOOONativeHistograms.Store(true)
+}
+
+// DisableOOONativeHistograms disables the ingestion of out-of-order native histograms.
+func (h *Head) DisableOOONativeHistograms() {
+	h.opts.EnableOOONativeHistograms.Store(false)
 }
 
 // PostingsCardinalityStats returns highest cardinality stats by label and value names.
@@ -2090,7 +2105,7 @@ type memSeries struct {
 	// before compaction: mmappedChunks=[p5,p6,p7,p8,p9] firstChunkID=5
 	//  after compaction: mmappedChunks=[p7,p8,p9]       firstChunkID=7
 	//
-	// pN is the pointer to the mmappedChunk referered to by HeadChunkID=N
+	// pN is the pointer to the mmappedChunk referred to by HeadChunkID=N
 	mmappedChunks []*mmappedChunk
 	// Most recent chunks in memory that are still being built or waiting to be mmapped.
 	// This is a linked list, headChunks points to the most recent chunk, headChunks.next points
