@@ -245,8 +245,11 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 }
 
 func main() {
+	//  如果是DEBUG模式
 	if os.Getenv("DEBUG") != "" {
+		// 开启对阻塞操作的跟踪
 		runtime.SetBlockProfileRate(20)
+		//  开启对锁调用的跟踪
 		runtime.SetMutexProfileFraction(20)
 	}
 
@@ -278,6 +281,7 @@ func main() {
 		promlogConfig: promlog.Config{},
 	}
 
+	// 解析启动参数和设置默认
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server").UsageWriter(os.Stdout)
 
 	a.Version(version.Print(appName))
