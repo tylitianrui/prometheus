@@ -538,7 +538,15 @@ func main() {
 	/*加载配置文件。
 		agentMode 代理模式，默认是false，不开启代理模式
 	    什么是代理模式？
-		代理模式是对远端写的优化。标准模式下的Promethues远端写会把数据写入到tsdb，metrics   ---> wal   ----> tsdb
+		代理模式是对远端写的优化。标准模式下的Promethues远端写会把数据写入到tsdb
+
+	                |-> 内存
+					|
+	metrics data  ->|
+					|		  |-->  queue (shard_1)   --> remote endpoint
+					|-> WAL --|-->  queue (shard...)  --> remote endpoint
+				      		  |-->  queue (shard_n)   --> remote endpoint
+
 		代理模式禁用查询、警报，
 	*/
 	var cfgFile *config.Config
