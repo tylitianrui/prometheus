@@ -270,6 +270,7 @@ func main() {
 		)
 	}
 
+	// 配置内容
 	cfg := flagConfig{
 		notifier: notifier.Options{
 			Registerer: prometheus.DefaultRegisterer,
@@ -281,7 +282,7 @@ func main() {
 		promlogConfig: promlog.Config{},
 	}
 
-	// 解析启动参数和设置默认
+	// 解析启动参数；校验配置的合法性；设置配置的默认值
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server").UsageWriter(os.Stdout)
 
 	a.Version(version.Print(appName))
@@ -488,6 +489,7 @@ func main() {
 		os.Exit(2)
 	}
 
+	// 创建日志logger对象
 	logger := promlog.New(&cfg.promlogConfig)
 
 	if err := cfg.setFeatureListOptions(logger); err != nil {
@@ -532,6 +534,13 @@ func main() {
 	}
 
 	// Throw error for invalid config before starting other components.
+	//
+	/*加载配置文件。
+		agentMode 代理模式，默认是false，不开启代理模式
+	    什么是代理模式？
+		代理模式是对远端写的优化。标准模式下的Promethues远端写会把数据写入到tsdb，metrics   ---> wal   ----> tsdb
+		代理模式禁用查询、警报，
+	*/
 	var cfgFile *config.Config
 	if cfgFile, err = config.LoadFile(cfg.configFile, agentMode, false, log.NewNopLogger()); err != nil {
 		absPath, pathErr := filepath.Abs(cfg.configFile)
