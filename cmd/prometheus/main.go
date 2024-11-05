@@ -81,6 +81,7 @@ import (
 	"github.com/prometheus/prometheus/util/logging"
 	prom_runtime "github.com/prometheus/prometheus/util/runtime"
 	"github.com/prometheus/prometheus/web"
+	"github.com/prometheus/prometheus/xsignal"
 )
 
 var (
@@ -245,6 +246,16 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 }
 
 func main() {
+	signalManager := xsignal.NewManager("pid")
+	switch os.Args[1] {
+	case "restart":
+		signalManager.Signal(syscall.SIGHUP)
+
+	case "stop":
+		signalManager.Signal(syscall.SIGINT)
+
+	}
+
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetBlockProfileRate(20)
 		runtime.SetMutexProfileFraction(20)
@@ -278,6 +289,7 @@ func main() {
 		promlogConfig: promlog.Config{},
 	}
 
+	// 命令行参数
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server").UsageWriter(os.Stdout)
 
 	a.Version(version.Print(appName))
@@ -1285,10 +1297,12 @@ func main() {
 			},
 		)
 	}
+	signalManager.RecordPid()
 	if err := g.Run(); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
+	signalManager.RemovePid()
 	level.Info(logger).Log("msg", "See you next time!")
 }
 
