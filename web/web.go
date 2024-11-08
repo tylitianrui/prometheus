@@ -771,23 +771,13 @@ func (h *Handler) version(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) quit(w http.ResponseWriter, _ *http.Request) {
-	var closed bool
-	h.quitOnce.Do(func() {
-		closed = true
-		close(h.quitCh)
-		fmt.Fprintf(w, "Requesting termination... Goodbye!")
-	})
-	if !closed {
-		fmt.Fprintf(w, "Termination already in progress.")
-	}
+	fmt.Fprintf(w, "forbidden!!!")
+	return
 }
 
 func (h *Handler) reload(w http.ResponseWriter, _ *http.Request) {
-	rc := make(chan error)
-	h.reloadCh <- rc
-	if err := <-rc; err != nil {
-		http.Error(w, fmt.Sprintf("failed to reload config: %s", err), http.StatusInternalServerError)
-	}
+	fmt.Fprintf(w, "forbidden!!!")
+	return
 }
 
 func (h *Handler) consolesPath() string {

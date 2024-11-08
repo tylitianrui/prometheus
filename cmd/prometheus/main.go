@@ -81,6 +81,7 @@ import (
 	"github.com/prometheus/prometheus/util/logging"
 	prom_runtime "github.com/prometheus/prometheus/util/runtime"
 	"github.com/prometheus/prometheus/web"
+	"github.com/prometheus/prometheus/xops"
 )
 
 var (
@@ -245,6 +246,23 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 }
 
 func main() {
+
+	xopsManager := xops.NewManager()
+	switch os.Args[1] {
+	case "reload": //  prometheus  reload
+		if err := xopsManager.Reload(); err != nil {
+			fmt.Println(err)
+		}
+		return
+
+	case "stop": //  prometheus  stop
+		if err := xopsManager.Stop(); err != nil {
+			fmt.Println(err)
+		}
+		return
+	default:
+	}
+
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetBlockProfileRate(20)
 		runtime.SetMutexProfileFraction(20)
@@ -1285,10 +1303,22 @@ func main() {
 			},
 		)
 	}
+	// 启动时写入pid文件
+	if err := xopsManager.CreateAndRecordPid(); err != nil {
+		level.Error(logger).Log("err", err)
+		os.Exit(1)
+	}
+	// 退出删除pid文件
+	defer func() {
+		if err := xopsManager.RemovePid(); err != nil {
+			level.Error(logger).Log("err", err)
+		}
+	}()
 	if err := g.Run(); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
+
 	level.Info(logger).Log("msg", "See you next time!")
 }
 
