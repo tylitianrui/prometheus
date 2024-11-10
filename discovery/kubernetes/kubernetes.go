@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"strings"
@@ -25,11 +26,10 @@ import (
 
 	"github.com/prometheus/prometheus/util/strutil"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
 	apiv1 "k8s.io/api/core/v1"
 	disv1 "k8s.io/api/discovery/v1"
@@ -173,7 +173,7 @@ func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	if c.Role == "" {
-		return fmt.Errorf("role missing (one of: pod, service, endpoints, endpointslice, node, ingress)")
+		return errors.New("role missing (one of: pod, service, endpoints, endpointslice, node, ingress)")
 	}
 	err = c.HTTPClientConfig.Validate()
 	if err != nil {
@@ -181,20 +181,20 @@ func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 	if c.APIServer.URL != nil && c.KubeConfig != "" {
 		// Api-server and kubeconfig_file are mutually exclusive
-		return fmt.Errorf("cannot use 'kubeconfig_file' and 'api_server' simultaneously")
+		return errors.New("cannot use 'kubeconfig_file' and 'api_server' simultaneously")
 	}
 	if c.KubeConfig != "" && !reflect.DeepEqual(c.HTTPClientConfig, config.DefaultHTTPClientConfig) {
 		// Kubeconfig_file and custom http config are mutually exclusive
-		return fmt.Errorf("cannot use a custom HTTP client configuration together with 'kubeconfig_file'")
+		return errors.New("cannot use a custom HTTP client configuration together with 'kubeconfig_file'")
 	}
 	if c.APIServer.URL == nil && !reflect.DeepEqual(c.HTTPClientConfig, config.DefaultHTTPClientConfig) {
-		return fmt.Errorf("to use custom HTTP client configuration please provide the 'api_server' URL explicitly")
+		return errors.New("to use custom HTTP client configuration please provide the 'api_server' URL explicitly")
 	}
 	if c.APIServer.URL != nil && c.NamespaceDiscovery.IncludeOwnNamespace {
-		return fmt.Errorf("cannot use 'api_server' and 'namespaces.own_namespace' simultaneously")
+		return errors.New("cannot use 'api_server' and 'namespaces.own_namespace' simultaneously")
 	}
 	if c.KubeConfig != "" && c.NamespaceDiscovery.IncludeOwnNamespace {
-		return fmt.Errorf("cannot use 'kubeconfig_file' and 'namespaces.own_namespace' simultaneously")
+		return errors.New("cannot use 'kubeconfig_file' and 'namespaces.own_namespace' simultaneously")
 	}
 
 	foundSelectorRoles := make(map[Role]struct{})
@@ -260,7 +260,7 @@ type Discovery struct {
 	sync.RWMutex
 	client             kubernetes.Interface
 	role               Role
-	logger             log.Logger
+	logger             *slog.Logger
 	namespaceDiscovery *NamespaceDiscovery
 	discoverers        []discovery.Discoverer
 	selectors          roleSelector
@@ -285,14 +285,14 @@ func (d *Discovery) getNamespaces() []string {
 }
 
 // New creates a new Kubernetes discovery for the given role.
-func New(l log.Logger, metrics discovery.DiscovererMetrics, conf *SDConfig) (*Discovery, error) {
+func New(l *slog.Logger, metrics discovery.DiscovererMetrics, conf *SDConfig) (*Discovery, error) {
 	m, ok := metrics.(*kubernetesMetrics)
 	if !ok {
-		return nil, fmt.Errorf("invalid discovery metrics type")
+		return nil, errors.New("invalid discovery metrics type")
 	}
 
 	if l == nil {
-		l = log.NewNopLogger()
+		l = promslog.NewNopLogger()
 	}
 	var (
 		kcfg         *rest.Config
@@ -324,7 +324,7 @@ func New(l log.Logger, metrics discovery.DiscovererMetrics, conf *SDConfig) (*Di
 			ownNamespace = string(ownNamespaceContents)
 		}
 
-		level.Info(l).Log("msg", "Using pod service account via in-cluster config")
+		l.Info("Using pod service account via in-cluster config")
 	default:
 		rt, err := config.NewRoundTripperFromConfig(conf.HTTPClientConfig, "kubernetes_sd")
 		if err != nil {
@@ -446,7 +446,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				go nodeInf.Run(ctx.Done())
 			}
 			eps := NewEndpointSlice(
-				log.With(d.logger, "role", "endpointslice"),
+				d.logger.With("role", "endpointslice"),
 				informer,
 				d.mustNewSharedInformer(slw, &apiv1.Service{}, resyncDisabled),
 				d.mustNewSharedInformer(plw, &apiv1.Pod{}, resyncDisabled),
@@ -506,7 +506,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 			}
 
 			eps := NewEndpoints(
-				log.With(d.logger, "role", "endpoint"),
+				d.logger.With("role", "endpoint"),
 				d.newEndpointsByNodeInformer(elw),
 				d.mustNewSharedInformer(slw, &apiv1.Service{}, resyncDisabled),
 				d.mustNewSharedInformer(plw, &apiv1.Pod{}, resyncDisabled),
@@ -540,7 +540,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				},
 			}
 			pod := NewPod(
-				log.With(d.logger, "role", "pod"),
+				d.logger.With("role", "pod"),
 				d.newPodsByNodeInformer(plw),
 				nodeInformer,
 				d.metrics.eventCount,
@@ -564,7 +564,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 				},
 			}
 			svc := NewService(
-				log.With(d.logger, "role", "service"),
+				d.logger.With("role", "service"),
 				d.mustNewSharedInformer(slw, &apiv1.Service{}, resyncDisabled),
 				d.metrics.eventCount,
 			)
@@ -589,7 +589,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 			}
 			informer = d.mustNewSharedInformer(ilw, &networkv1.Ingress{}, resyncDisabled)
 			ingress := NewIngress(
-				log.With(d.logger, "role", "ingress"),
+				d.logger.With("role", "ingress"),
 				informer,
 				d.metrics.eventCount,
 			)
@@ -598,11 +598,11 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 		}
 	case RoleNode:
 		nodeInformer := d.newNodeInformer(ctx)
-		node := NewNode(log.With(d.logger, "role", "node"), nodeInformer, d.metrics.eventCount)
+		node := NewNode(d.logger.With("role", "node"), nodeInformer, d.metrics.eventCount)
 		d.discoverers = append(d.discoverers, node)
 		go node.informer.Run(ctx.Done())
 	default:
-		level.Error(d.logger).Log("msg", "unknown Kubernetes discovery kind", "role", d.role)
+		d.logger.Error("unknown Kubernetes discovery kind", "role", d.role)
 	}
 
 	var wg sync.WaitGroup
@@ -672,7 +672,7 @@ func (d *Discovery) newPodsByNodeInformer(plw *cache.ListWatch) cache.SharedInde
 		indexers[nodeIndex] = func(obj interface{}) ([]string, error) {
 			pod, ok := obj.(*apiv1.Pod)
 			if !ok {
-				return nil, fmt.Errorf("object is not a pod")
+				return nil, errors.New("object is not a pod")
 			}
 			return []string{pod.Spec.NodeName}, nil
 		}
@@ -686,7 +686,7 @@ func (d *Discovery) newEndpointsByNodeInformer(plw *cache.ListWatch) cache.Share
 	indexers[podIndex] = func(obj interface{}) ([]string, error) {
 		e, ok := obj.(*apiv1.Endpoints)
 		if !ok {
-			return nil, fmt.Errorf("object is not endpoints")
+			return nil, errors.New("object is not endpoints")
 		}
 		var pods []string
 		for _, target := range e.Subsets {
@@ -705,7 +705,7 @@ func (d *Discovery) newEndpointsByNodeInformer(plw *cache.ListWatch) cache.Share
 	indexers[nodeIndex] = func(obj interface{}) ([]string, error) {
 		e, ok := obj.(*apiv1.Endpoints)
 		if !ok {
-			return nil, fmt.Errorf("object is not endpoints")
+			return nil, errors.New("object is not endpoints")
 		}
 		var nodes []string
 		for _, target := range e.Subsets {
@@ -751,7 +751,7 @@ func (d *Discovery) newEndpointSlicesByNodeInformer(plw *cache.ListWatch, object
 				}
 			}
 		default:
-			return nil, fmt.Errorf("object is not an endpointslice")
+			return nil, errors.New("object is not an endpointslice")
 		}
 
 		return nodes, nil
@@ -803,4 +803,14 @@ func addObjectMetaLabels(labelSet model.LabelSet, objectMeta metav1.ObjectMeta, 
 
 func namespacedName(namespace, name string) string {
 	return namespace + "/" + name
+}
+
+// nodeName knows how to handle the cache.DeletedFinalStateUnknown tombstone.
+// It assumes the MetaNamespaceKeyFunc keyFunc is used, which uses the node name as the tombstone key.
+func nodeName(o interface{}) (string, error) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(o)
+	if err != nil {
+		return "", err
+	}
+	return key, nil
 }

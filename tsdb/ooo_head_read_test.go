@@ -360,7 +360,7 @@ func TestOOOHeadIndexReader_Series(t *testing.T) {
 						})
 					}
 
-					ir := NewHeadAndOOOIndexReader(h, tc.queryMinT, tc.queryMaxT, 0)
+					ir := NewHeadAndOOOIndexReader(h, tc.queryMinT, tc.queryMinT, tc.queryMaxT, 0)
 
 					var chks []chunks.Meta
 					var b labels.ScratchBuilder
@@ -451,7 +451,7 @@ func testOOOHeadChunkReader_LabelValues(t *testing.T, scenario sampleTypeScenari
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// We first want to test using a head index reader that covers the biggest query interval
-			oh := NewHeadAndOOOIndexReader(head, tc.queryMinT, tc.queryMaxT, 0)
+			oh := NewHeadAndOOOIndexReader(head, tc.queryMinT, tc.queryMinT, tc.queryMaxT, 0)
 			matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "foo", "bar1")}
 			values, err := oh.LabelValues(ctx, "foo", matchers...)
 			sort.Strings(values)
@@ -509,7 +509,7 @@ func testOOOHeadChunkReader_Chunk(t *testing.T, scenario sampleTypeScenario) {
 			Ref: 0x1800000, Chunk: chunkenc.Chunk(nil), MinTime: 100, MaxTime: 300,
 		})
 		require.Nil(t, iterable)
-		require.Equal(t, err, fmt.Errorf("not found"))
+		require.EqualError(t, err, "not found")
 		require.Nil(t, c)
 	})
 
@@ -857,7 +857,7 @@ func testOOOHeadChunkReader_Chunk(t *testing.T, scenario sampleTypeScenario) {
 
 			// The Series method populates the chunk metas, taking a copy of the
 			// head OOO chunk if necessary. These are then used by the ChunkReader.
-			ir := NewHeadAndOOOIndexReader(db.head, tc.queryMinT, tc.queryMaxT, 0)
+			ir := NewHeadAndOOOIndexReader(db.head, tc.queryMinT, tc.queryMinT, tc.queryMaxT, 0)
 			var chks []chunks.Meta
 			var b labels.ScratchBuilder
 			err = ir.Series(s1Ref, &b, &chks)
@@ -878,7 +878,7 @@ func testOOOHeadChunkReader_Chunk(t *testing.T, scenario sampleTypeScenario) {
 				}
 				resultSamples, err := storage.ExpandSamples(it, nil)
 				require.NoError(t, err)
-				requireEqualSamples(t, s1.String(), tc.expChunksSamples[i], resultSamples, true)
+				requireEqualSamples(t, s1.String(), tc.expChunksSamples[i], resultSamples, requireEqualSamplesIgnoreCounterResets)
 			}
 		})
 	}
@@ -1028,7 +1028,7 @@ func testOOOHeadChunkReader_Chunk_ConsistentQueryResponseDespiteOfHeadExpanding(
 
 			// The Series method populates the chunk metas, taking a copy of the
 			// head OOO chunk if necessary. These are then used by the ChunkReader.
-			ir := NewHeadAndOOOIndexReader(db.head, tc.queryMinT, tc.queryMaxT, 0)
+			ir := NewHeadAndOOOIndexReader(db.head, tc.queryMinT, tc.queryMinT, tc.queryMaxT, 0)
 			var chks []chunks.Meta
 			var b labels.ScratchBuilder
 			err = ir.Series(s1Ref, &b, &chks)
@@ -1054,7 +1054,7 @@ func testOOOHeadChunkReader_Chunk_ConsistentQueryResponseDespiteOfHeadExpanding(
 				it := iterable.Iterator(nil)
 				resultSamples, err := storage.ExpandSamples(it, nil)
 				require.NoError(t, err)
-				requireEqualSamples(t, s1.String(), tc.expChunksSamples[i], resultSamples, true)
+				requireEqualSamples(t, s1.String(), tc.expChunksSamples[i], resultSamples, requireEqualSamplesIgnoreCounterResets)
 			}
 		})
 	}
