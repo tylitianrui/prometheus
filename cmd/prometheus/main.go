@@ -284,6 +284,7 @@ func main() {
 
 	a.HelpFlag.Short('h')
 
+	//  启动命令   ./prometheus --config.file=documentation/examples/prometheus.yml
 	a.Flag("config.file", "Prometheus configuration file path.").
 		Default("prometheus.yml").StringVar(&cfg.configFile)
 
@@ -528,6 +529,8 @@ func main() {
 	}
 
 	// Throw error for invalid config before starting other components.
+	// 解析  校验 配置文件
+	// 启动 ./prometheus --config.file=documentation/examples/prometheus.yml
 	var cfgFile *config.Config
 	if cfgFile, err = config.LoadFile(cfg.configFile, agentMode, false, log.NewNopLogger()); err != nil {
 		absPath, pathErr := filepath.Abs(cfg.configFile)
@@ -973,6 +976,7 @@ func main() {
 	{
 		// Termination handler.
 		term := make(chan os.Signal, 1)
+		// 监听信号            ctrl+c  2       kill  -15
 		signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 		cancel := make(chan struct{})
 		g.Add(
@@ -996,7 +1000,7 @@ func main() {
 		)
 	}
 	{
-		// Scrape discovery manager.
+		// Scrape discovery manager.  被监控对象地址
 		g.Add(
 			func() error {
 				err := discoveryManagerScrape.Run()
@@ -1010,7 +1014,7 @@ func main() {
 		)
 	}
 	{
-		// Notify discovery manager.
+		// Notify discovery manager. 告警
 		g.Add(
 			func() error {
 				err := discoveryManagerNotify.Run()
@@ -1023,6 +1027,7 @@ func main() {
 			},
 		)
 	}
+	//
 	if !agentMode {
 		// Rule manager.
 		g.Add(
@@ -1183,6 +1188,7 @@ func main() {
 				startTimeMargin := int64(2 * time.Duration(cfg.tsdb.MinBlockDuration).Seconds() * 1000)
 				localStorage.Set(db, startTimeMargin)
 				db.SetWriteNotified(remoteStorage)
+
 				close(dbOpen)
 				<-cancel
 				return nil
@@ -1237,6 +1243,7 @@ func main() {
 
 				localStorage.Set(db, 0)
 				db.SetWriteNotified(remoteStorage)
+
 				close(dbOpen)
 				<-cancel
 				return nil
