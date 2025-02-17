@@ -46,6 +46,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
@@ -187,11 +188,11 @@ func readTestWAL(t testing.TB, dir string) (recs []interface{}) {
 			samples, err := dec.Samples(rec, nil)
 			require.NoError(t, err)
 			recs = append(recs, samples)
-		case record.HistogramSamples:
+		case record.HistogramSamples, record.CustomBucketsHistogramSamples:
 			samples, err := dec.HistogramSamples(rec, nil)
 			require.NoError(t, err)
 			recs = append(recs, samples)
-		case record.FloatHistogramSamples:
+		case record.FloatHistogramSamples, record.CustomBucketsFloatHistogramSamples:
 			samples, err := dec.FloatHistogramSamples(rec, nil)
 			require.NoError(t, err)
 			recs = append(recs, samples)
@@ -440,27 +441,41 @@ func BenchmarkLoadWLs(b *testing.B) {
 
 // BenchmarkLoadRealWLs will be skipped unless the BENCHMARK_LOAD_REAL_WLS_DIR environment variable is set.
 // BENCHMARK_LOAD_REAL_WLS_DIR should be the folder where `wal` and `chunks_head` are located.
+//
+// Using an absolute path for BENCHMARK_LOAD_REAL_WLS_DIR is recommended.
+//
+// Because WLs loading may alter BENCHMARK_LOAD_REAL_WLS_DIR which can affect benchmark results and to ensure consistency,
+// a copy of BENCHMARK_LOAD_REAL_WLS_DIR is made for each iteration and deleted at the end.
+// Make sure there is sufficient disk space for that.
 func BenchmarkLoadRealWLs(b *testing.B) {
-	dir := os.Getenv("BENCHMARK_LOAD_REAL_WLS_DIR")
-	if dir == "" {
+	srcDir := os.Getenv("BENCHMARK_LOAD_REAL_WLS_DIR")
+	if srcDir == "" {
 		b.SkipNow()
 	}
 
-	wal, err := wlog.New(nil, nil, filepath.Join(dir, "wal"), wlog.CompressionNone)
-	require.NoError(b, err)
-	b.Cleanup(func() { wal.Close() })
-
-	wbl, err := wlog.New(nil, nil, filepath.Join(dir, "wbl"), wlog.CompressionNone)
-	require.NoError(b, err)
-	b.Cleanup(func() { wbl.Close() })
-
 	// Load the WAL.
 	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		dir := b.TempDir()
+		require.NoError(b, fileutil.CopyDirs(srcDir, dir))
+
+		wal, err := wlog.New(nil, nil, filepath.Join(dir, "wal"), wlog.CompressionNone)
+		require.NoError(b, err)
+		b.Cleanup(func() { wal.Close() })
+
+		wbl, err := wlog.New(nil, nil, filepath.Join(dir, "wbl"), wlog.CompressionNone)
+		require.NoError(b, err)
+		b.Cleanup(func() { wbl.Close() })
+		b.StartTimer()
+
 		opts := DefaultHeadOptions()
 		opts.ChunkDirRoot = dir
 		h, err := NewHead(nil, nil, wal, wbl, opts, nil)
 		require.NoError(b, err)
 		require.NoError(b, h.Init(0))
+
+		b.StopTimer()
+		require.NoError(b, os.RemoveAll(dir))
 	}
 }
 
@@ -962,12 +977,12 @@ func TestHead_Truncate(t *testing.T) {
 	require.Nil(t, h.series.getByID(s3.ref))
 	require.Nil(t, h.series.getByID(s4.ref))
 
-	postingsA1, _ := index.ExpandPostings(h.postings.Get("a", "1"))
-	postingsA2, _ := index.ExpandPostings(h.postings.Get("a", "2"))
-	postingsB1, _ := index.ExpandPostings(h.postings.Get("b", "1"))
-	postingsB2, _ := index.ExpandPostings(h.postings.Get("b", "2"))
-	postingsC1, _ := index.ExpandPostings(h.postings.Get("c", "1"))
-	postingsAll, _ := index.ExpandPostings(h.postings.Get("", ""))
+	postingsA1, _ := index.ExpandPostings(h.postings.Postings(ctx, "a", "1"))
+	postingsA2, _ := index.ExpandPostings(h.postings.Postings(ctx, "a", "2"))
+	postingsB1, _ := index.ExpandPostings(h.postings.Postings(ctx, "b", "1"))
+	postingsB2, _ := index.ExpandPostings(h.postings.Postings(ctx, "b", "2"))
+	postingsC1, _ := index.ExpandPostings(h.postings.Postings(ctx, "c", "1"))
+	postingsAll, _ := index.ExpandPostings(h.postings.Postings(ctx, "", ""))
 
 	require.Equal(t, []storage.SeriesRef{storage.SeriesRef(s1.ref)}, postingsA1)
 	require.Equal(t, []storage.SeriesRef{storage.SeriesRef(s2.ref)}, postingsA2)
@@ -1594,7 +1609,6 @@ func TestDelete_e2e(t *testing.T) {
 		for i := 0; i < numRanges; i++ {
 			q, err := NewBlockQuerier(hb, 0, 100000)
 			require.NoError(t, err)
-			defer q.Close()
 			ss := q.Select(context.Background(), true, nil, del.ms...)
 			// Build the mockSeriesSet.
 			matchedSeries := make([]storage.Series, 0, len(matched))
@@ -1635,6 +1649,7 @@ func TestDelete_e2e(t *testing.T) {
 			}
 			require.NoError(t, ss.Err())
 			require.Empty(t, ss.Warnings())
+			require.NoError(t, q.Close())
 		}
 	}
 }

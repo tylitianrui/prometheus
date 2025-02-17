@@ -135,7 +135,7 @@ func TestBasicContentNegotiation(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil, true)
+			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil)
 			defer s.Close()
 
 			var (
@@ -243,7 +243,7 @@ func TestSampleDelivery(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("%s-%s", tc.protoMsg, tc.name), func(t *testing.T) {
 			dir := t.TempDir()
-			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil, true)
+			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil)
 			defer s.Close()
 
 			var (
@@ -342,10 +342,10 @@ func TestMetadataDelivery(t *testing.T) {
 	numMetadata := 1532
 	for i := 0; i < numMetadata; i++ {
 		metadata = append(metadata, scrape.MetricMetadata{
-			Metric: "prometheus_remote_storage_sent_metadata_bytes_total_" + strconv.Itoa(i),
-			Type:   model.MetricTypeCounter,
-			Help:   "a nice help text",
-			Unit:   "",
+			MetricFamily: "prometheus_remote_storage_sent_metadata_bytes_" + strconv.Itoa(i),
+			Type:         model.MetricTypeCounter,
+			Help:         "a nice help text",
+			Unit:         "",
 		})
 	}
 
@@ -357,12 +357,12 @@ func TestMetadataDelivery(t *testing.T) {
 	// fit into MaxSamplesPerSend.
 	require.Equal(t, numMetadata/config.DefaultMetadataConfig.MaxSamplesPerSend+1, c.writesReceived)
 	// Make sure the last samples were sent.
-	require.Equal(t, c.receivedMetadata[metadata[len(metadata)-1].Metric][0].MetricFamilyName, metadata[len(metadata)-1].Metric)
+	require.Equal(t, c.receivedMetadata[metadata[len(metadata)-1].MetricFamily][0].MetricFamilyName, metadata[len(metadata)-1].MetricFamily)
 }
 
 func TestWALMetadataDelivery(t *testing.T) {
 	dir := t.TempDir()
-	s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil, true)
+	s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil)
 	defer s.Close()
 
 	cfg := config.DefaultQueueConfig
