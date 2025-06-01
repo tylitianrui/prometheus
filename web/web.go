@@ -291,6 +291,7 @@ type Options struct {
 	EnableRemoteWriteReceiver  bool
 	EnableOTLPWriteReceiver    bool
 	ConvertOTLPDelta           bool
+	NativeOTLPDeltaIngestion   bool
 	IsAgent                    bool
 	CTZeroIngestionEnabled     bool
 	AppName                    string
@@ -390,6 +391,7 @@ func New(logger *slog.Logger, o *Options) *Handler {
 		o.AcceptRemoteWriteProtoMsgs,
 		o.EnableOTLPWriteReceiver,
 		o.ConvertOTLPDelta,
+		o.NativeOTLPDeltaIngestion,
 		o.CTZeroIngestionEnabled,
 	)
 
@@ -843,7 +845,7 @@ func (h *Handler) runtimeInfo() (api_v1.RuntimeInfo, error) {
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		return status, fmt.Errorf("Error getting hostname: %w", err)
+		return status, fmt.Errorf("error getting hostname: %w", err)
 	}
 	status.Hostname = hostname
 	status.ServerTime = time.Now().UTC()
