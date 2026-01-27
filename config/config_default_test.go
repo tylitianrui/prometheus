@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,6 +22,7 @@ var ruleFilesExpectedConf = &Config{
 
 	GlobalConfig: DefaultGlobalConfig,
 	Runtime:      DefaultRuntimeConfig,
+	OTLPConfig:   DefaultOTLPConfig,
 	RuleFiles: []string{
 		"testdata/first.rules",
 		"testdata/rules/second.rules",

@@ -3,7 +3,6 @@ import {
   Group,
   Table,
   Text,
-  Accordion,
   Badge,
   Tooltip,
   Box,
@@ -13,6 +12,7 @@ import {
   Anchor,
   Pagination,
   rem,
+  Divider,
 } from "@mantine/core";
 import { useSuspenseAPIQuery } from "../api/api";
 import { AlertingRule, AlertingRulesResult } from "../api/responseTypes/rules";
@@ -37,6 +37,8 @@ import { useDebouncedValue } from "@mantine/hooks";
 import { KVSearch } from "@nexucis/kvsearch";
 import { inputIconStyle } from "../styles";
 import CustomInfiniteScroll from "../components/CustomInfiniteScroll";
+import classes from "./AlertsPage.module.css";
+import { Accordion } from "../components/Accordion";
 
 type AlertsPageData = {
   // How many rules are in each state across all groups.
@@ -44,6 +46,7 @@ type AlertsPageData = {
     inactive: number;
     pending: number;
     firing: number;
+    unknown: number;
   };
   groups: {
     name: string;
@@ -54,6 +57,7 @@ type AlertsPageData = {
       inactive: number;
       pending: number;
       firing: number;
+      unknown: number;
     };
     rules: {
       rule: AlertingRule;
@@ -81,6 +85,7 @@ const buildAlertsPageData = (
       inactive: 0,
       pending: 0,
       firing: 0,
+      unknown: 0,
     },
     groups: [],
   };
@@ -91,6 +96,7 @@ const buildAlertsPageData = (
       inactive: 0,
       pending: 0,
       firing: 0,
+      unknown: 0,
     };
 
     for (const r of group.rules) {
@@ -107,6 +113,10 @@ const buildAlertsPageData = (
         case "pending":
           pageData.globalCounts.pending++;
           groupCounts.pending++;
+          break;
+        case "unknown":
+          pageData.globalCounts.unknown++;
+          groupCounts.unknown++;
           break;
         default:
           throw new Error(`Unknown rule state: ${r.state}`);
@@ -238,6 +248,11 @@ export default function AlertsPage() {
                   pending ({g.counts.pending})
                 </Badge>
               )}
+              {g.counts.unknown > 0 && (
+                <Badge className={badgeClasses.healthUnknown}>
+                  unknown ({g.counts.unknown})
+                </Badge>
+              )}
               {g.counts.inactive > 0 && (
                 <Badge className={badgeClasses.healthOk}>
                   inactive ({g.counts.inactive})
@@ -272,20 +287,11 @@ export default function AlertsPage() {
             <CustomInfiniteScroll
               allItems={g.rules}
               child={({ items }) => (
-                <Accordion multiple variant="separated">
+                <Accordion multiple variant="separated" classNames={classes}>
                   {items.map((r, j) => {
                     return (
                       <Accordion.Item
                         mt={rem(5)}
-                        styles={{
-                          item: {
-                            // TODO: This transparency hack is an OK workaround to make the collapsed items
-                            // have a different background color than their surrounding group card in dark mode,
-                            // but it would be better to use CSS to override the light/dark colors for
-                            // collapsed/expanded accordion items.
-                            backgroundColor: "#c0c0c015",
-                          },
-                        }}
                         key={j}
                         value={j.toString()}
                         className={
@@ -293,7 +299,9 @@ export default function AlertsPage() {
                             ? panelClasses.panelHealthErr
                             : r.counts.pending > 0
                               ? panelClasses.panelHealthWarn
-                              : panelClasses.panelHealthOk
+                              : r.rule.state === "unknown"
+                                ? panelClasses.panelHealthUnknown
+                                : panelClasses.panelHealthOk
                         }
                       >
                         <Accordion.Control
@@ -318,79 +326,88 @@ export default function AlertsPage() {
                         <Accordion.Panel>
                           <RuleDefinition rule={r.rule} />
                           {r.rule.alerts.length > 0 && (
-                            <Table mt="lg">
-                              <Table.Thead>
-                                <Table.Tr style={{ whiteSpace: "nowrap" }}>
-                                  <Table.Th>Alert labels</Table.Th>
-                                  <Table.Th>State</Table.Th>
-                                  <Table.Th>Active Since</Table.Th>
-                                  <Table.Th>Value</Table.Th>
-                                </Table.Tr>
-                              </Table.Thead>
-                              <Table.Tbody>
-                                {r.rule.type === "alerting" &&
-                                  r.rule.alerts.map((a, k) => (
-                                    <Fragment key={k}>
-                                      <Table.Tr>
-                                        <Table.Td>
-                                          <LabelBadges labels={a.labels} />
-                                        </Table.Td>
-                                        <Table.Td>
-                                          <Badge
-                                            className={
-                                              a.state === "firing"
-                                                ? badgeClasses.healthErr
-                                                : badgeClasses.healthWarn
-                                            }
-                                          >
-                                            {a.state}
-                                          </Badge>
-                                        </Table.Td>
-                                        <Table.Td
-                                          style={{ whiteSpace: "nowrap" }}
-                                        >
-                                          <Tooltip label={a.activeAt}>
-                                            <Box>
-                                              {humanizeDurationRelative(
-                                                a.activeAt,
-                                                now(),
-                                                ""
-                                              )}
-                                            </Box>
-                                          </Tooltip>
-                                        </Table.Td>
-                                        <Table.Td
-                                          style={{ whiteSpace: "nowrap" }}
-                                        >
-                                          {isNaN(Number(a.value))
-                                            ? a.value
-                                            : Number(a.value)}
-                                        </Table.Td>
+                            <>
+                              <Divider my="md" />
+                              <CustomInfiniteScroll
+                                allItems={r.rule.alerts}
+                                child={({ items }) => (
+                                  <Table mt="lg">
+                                    <Table.Thead>
+                                      <Table.Tr
+                                        style={{ whiteSpace: "nowrap" }}
+                                      >
+                                        <Table.Th>Alert labels</Table.Th>
+                                        <Table.Th>State</Table.Th>
+                                        <Table.Th>Active Since</Table.Th>
+                                        <Table.Th>Value</Table.Th>
                                       </Table.Tr>
-                                      {showAnnotations && (
-                                        <Table.Tr>
-                                          <Table.Td colSpan={4}>
-                                            <Table mt="md" mb="xl">
-                                              <Table.Tbody>
-                                                {Object.entries(
-                                                  a.annotations
-                                                ).map(([k, v]) => (
-                                                  <Table.Tr key={k}>
-                                                    <Table.Th c="light-dark(var(--mantine-color-gray-7), var(--mantine-color-gray-4))">
-                                                      {k}
-                                                    </Table.Th>
-                                                    <Table.Td>{v}</Table.Td>
-                                                  </Table.Tr>
-                                                ))}
-                                              </Table.Tbody>
-                                            </Table>
-                                          </Table.Td>
-                                        </Table.Tr>
-                                      )}
-                                    </Fragment>
-                                  ))}
-                              </Table.Tbody>
-                            </Table>
+                                    </Table.Thead>
+                                    <Table.Tbody>
+                                      {items.map((a, k) => (
+                                        <Fragment key={k}>
+                                          <Table.Tr>
+                                            <Table.Td>
+                                              <LabelBadges labels={a.labels} />
+                                            </Table.Td>
+                                            <Table.Td>
+                                              <Badge
+                                                className={
+                                                  a.state === "firing"
+                                                    ? badgeClasses.healthErr
+                                                    : badgeClasses.healthWarn
+                                                }
+                                              >
+                                                {a.state}
+                                              </Badge>
+                                            </Table.Td>
+                                            <Table.Td
+                                              style={{ whiteSpace: "nowrap" }}
+                                            >
+                                              <Tooltip label={a.activeAt}>
+                                                <Box>
+                                                  {humanizeDurationRelative(
+                                                    a.activeAt,
+                                                    now(),
+                                                    ""
+                                                  )}
+                                                </Box>
+                                              </Tooltip>
+                                            </Table.Td>
+                                            <Table.Td
+                                              style={{ whiteSpace: "nowrap" }}
+                                            >
+                                              {isNaN(Number(a.value))
+                                                ? a.value
+                                                : Number(a.value)}
+                                            </Table.Td>
+                                          </Table.Tr>
+                                          {showAnnotations && (
+                                            <Table.Tr>
+                                              <Table.Td colSpan={4}>
+                                                <Table mt="md" mb="xl">
+                                                  <Table.Tbody>
+                                                    {Object.entries(
+                                                      a.annotations
+                                                    ).map(([k, v]) => (
+                                                      <Table.Tr key={k}>
+                                                        <Table.Th c="light-dark(var(--mantine-color-gray-7), var(--mantine-color-gray-4))">
+                                                          {k}
+                                                        </Table.Th>
+                                                        <Table.Td>{v}</Table.Td>
+                                                      </Table.Tr>
+                                                    ))}
+                                                  </Table.Tbody>
+                                                </Table>
+                                              </Table.Td>
+                                            </Table.Tr>
+                                          )}
+                                        </Fragment>
+                                      ))}
+                                    </Table.Tbody>
+                                  </Table>
+                                )}
+                              ></CustomInfiniteScroll>
+                            </>
                           )}
                         </Accordion.Panel>
                       </Accordion.Item>
@@ -409,13 +426,15 @@ export default function AlertsPage() {
     <Stack mt="xs">
       <Group>
         <StateMultiSelect
-          options={["inactive", "pending", "firing"]}
+          options={["inactive", "pending", "firing", "unknown"]}
           optionClass={(o) =>
             o === "inactive"
               ? badgeClasses.healthOk
               : o === "pending"
                 ? badgeClasses.healthWarn
-                : badgeClasses.healthErr
+                : o === "firing"
+                  ? badgeClasses.healthErr
+                  : badgeClasses.healthUnknown
           }
           optionCount={(o) =>
             alertsPageData.globalCounts[

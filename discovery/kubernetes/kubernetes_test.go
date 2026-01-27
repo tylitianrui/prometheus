@@ -1,4 +1,4 @@
-// Copyright 2018 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -302,7 +302,6 @@ func TestFailuresCountMetric(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(string(tc.role), func(t *testing.T) {
 			t.Parallel()
 
@@ -311,7 +310,7 @@ func TestFailuresCountMetric(t *testing.T) {
 			require.Equal(t, float64(0), prom_testutil.ToFloat64(n.metrics.failuresCount))
 
 			// Simulate an error on watch requests.
-			c.Discovery().(*fakediscovery.FakeDiscovery).PrependWatchReactor("*", func(_ kubetesting.Action) (bool, watch.Interface, error) {
+			c.Discovery().(*fakediscovery.FakeDiscovery).PrependWatchReactor("*", func(kubetesting.Action) (bool, watch.Interface, error) {
 				return true, nil, apierrors.NewUnauthorized("unauthorized")
 			})
 
