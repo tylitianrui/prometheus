@@ -15,6 +15,8 @@ package v1
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,7 +63,10 @@ import (
 	"github.com/prometheus/prometheus/util/stats"
 	"github.com/prometheus/prometheus/util/teststorage"
 	"github.com/prometheus/prometheus/util/testutil"
+	"github.com/prometheus/prometheus/web/api/testhelpers"
 )
+
+var testParser = parser.NewParser(parser.Options{})
 
 func testEngine(t *testing.T) *promql.Engine {
 	t.Helper()
@@ -250,11 +255,11 @@ type rulesRetrieverMock struct {
 }
 
 func (m *rulesRetrieverMock) CreateAlertingRules() {
-	expr1, err := parser.ParseExpr(`absent(test_metric3) != 1`)
+	expr1, err := testParser.ParseExpr(`absent(test_metric3) != 1`)
 	require.NoError(m.testing, err)
-	expr2, err := parser.ParseExpr(`up == 1`)
+	expr2, err := testParser.ParseExpr(`up == 1`)
 	require.NoError(m.testing, err)
-	expr3, err := parser.ParseExpr(`vector(1)`)
+	expr3, err := testParser.ParseExpr(`vector(1)`)
 	require.NoError(m.testing, err)
 
 	rule1 := rules.NewAlertingRule(
@@ -353,7 +358,7 @@ func (m *rulesRetrieverMock) CreateRuleGroups() {
 		r = append(r, alertrule)
 	}
 
-	recordingExpr, err := parser.ParseExpr(`vector(1)`)
+	recordingExpr, err := testParser.ParseExpr(`vector(1)`)
 	require.NoError(m.testing, err, "unable to parse alert expression")
 	recordingRule := rules.NewRecordingRule("recording-rule-1", recordingExpr, labels.Labels{})
 	recordingRule2 := rules.NewRecordingRule("recording-rule-2", recordingExpr, labels.FromStrings("testlabel", "rule"))
@@ -506,6 +511,7 @@ func TestEndpoints(t *testing.T) {
 			config:                func() config.Config { return samplePrometheusCfg },
 			ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
 			rulesRetriever:        algr.toFactory(),
+			parser:                testParser,
 		}
 		testEndpoints(t, api, testTargetRetriever, true)
 	})
@@ -570,6 +576,7 @@ func TestEndpoints(t *testing.T) {
 			config:                func() config.Config { return samplePrometheusCfg },
 			ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
 			rulesRetriever:        algr.toFactory(),
+			parser:                testParser,
 		}
 		testEndpoints(t, api, testTargetRetriever, false)
 	})
@@ -595,6 +602,7 @@ func TestGetSeries(t *testing.T) {
 
 	api := &API{
 		Queryable: s,
+		parser:    testParser,
 	}
 	request := func(method string, matchers ...string) (*http.Request, error) {
 		u, err := url.Parse("http://example.com")
@@ -605,7 +613,7 @@ func TestGetSeries(t *testing.T) {
 		}
 		u.RawQuery = q.Encode()
 
-		r, err := http.NewRequest(method, u.String(), nil)
+		r, err := http.NewRequest(method, u.String(), http.NoBody)
 		if method == http.MethodPost {
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
@@ -659,6 +667,7 @@ func TestGetSeries(t *testing.T) {
 			expectedErrorType: errorExec,
 			api: &API{
 				Queryable: errorTestQueryable{err: errors.New("generic")},
+				parser:    testParser,
 			},
 		},
 		{
@@ -667,6 +676,7 @@ func TestGetSeries(t *testing.T) {
 			expectedErrorType: errorInternal,
 			api: &API{
 				Queryable: errorTestQueryable{err: promql.ErrStorage{Err: errors.New("generic")}},
+				parser:    testParser,
 			},
 		},
 	} {
@@ -704,13 +714,14 @@ func TestQueryExemplars(t *testing.T) {
 		Queryable:         s,
 		QueryEngine:       testEngine(t),
 		ExemplarQueryable: s,
+		parser:            testParser,
 	}
 
 	request := func(method string, qs url.Values) (*http.Request, error) {
 		u, err := url.Parse("http://example.com")
 		require.NoError(t, err)
 		u.RawQuery = qs.Encode()
-		r, err := http.NewRequest(method, u.String(), nil)
+		r, err := http.NewRequest(method, u.String(), http.NoBody)
 		if method == http.MethodPost {
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
@@ -760,6 +771,7 @@ func TestQueryExemplars(t *testing.T) {
 			expectedErrorType: errorExec,
 			api: &API{
 				ExemplarQueryable: errorTestQueryable{err: errors.New("generic")},
+				parser:            testParser,
 			},
 			query: url.Values{
 				"query": []string{`test_metric3{foo="boo"} - test_metric4{foo="bar"}`},
@@ -772,6 +784,7 @@ func TestQueryExemplars(t *testing.T) {
 			expectedErrorType: errorInternal,
 			api: &API{
 				ExemplarQueryable: errorTestQueryable{err: promql.ErrStorage{Err: errors.New("generic")}},
+				parser:            testParser,
 			},
 			query: url.Values{
 				"query": []string{`test_metric3{foo="boo"} - test_metric4{foo="bar"}`},
@@ -812,6 +825,7 @@ func TestLabelNames(t *testing.T) {
 
 	api := &API{
 		Queryable: s,
+		parser:    testParser,
 	}
 	request := func(method, limit string, matchers ...string) (*http.Request, error) {
 		u, err := url.Parse("http://example.com")
@@ -825,7 +839,7 @@ func TestLabelNames(t *testing.T) {
 		}
 		u.RawQuery = q.Encode()
 
-		r, err := http.NewRequest(method, u.String(), nil)
+		r, err := http.NewRequest(method, u.String(), http.NoBody)
 		if method == http.MethodPost {
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
@@ -876,6 +890,7 @@ func TestLabelNames(t *testing.T) {
 			expectedErrorType: errorExec,
 			api: &API{
 				Queryable: errorTestQueryable{err: errors.New("generic")},
+				parser:    testParser,
 			},
 		},
 		{
@@ -884,6 +899,7 @@ func TestLabelNames(t *testing.T) {
 			expectedErrorType: errorInternal,
 			api: &API{
 				Queryable: errorTestQueryable{err: promql.ErrStorage{Err: errors.New("generic")}},
+				parser:    testParser,
 			},
 		},
 	} {
@@ -916,6 +932,7 @@ func TestStats(t *testing.T) {
 	api := &API{
 		Queryable:   s,
 		QueryEngine: testEngine(t),
+		parser:      testParser,
 		now: func() time.Time {
 			return time.Unix(123, 0)
 		},
@@ -931,7 +948,7 @@ func TestStats(t *testing.T) {
 		q.Add("step", "10")
 		u.RawQuery = q.Encode()
 
-		r, err := http.NewRequest(method, u.String(), nil)
+		r, err := http.NewRequest(method, u.String(), http.NoBody)
 		if method == http.MethodPost {
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
@@ -966,6 +983,7 @@ func TestStats(t *testing.T) {
 				require.NotNil(t, qs.Samples)
 				require.NotNil(t, qs.Samples.TotalQueryableSamples)
 				require.Nil(t, qs.Samples.TotalQueryableSamplesPerStep)
+				require.GreaterOrEqual(t, qs.Samples.SamplesRead, int64(0))
 			},
 		},
 		{
@@ -981,6 +999,8 @@ func TestStats(t *testing.T) {
 				require.NotNil(t, qs.Samples)
 				require.NotNil(t, qs.Samples.TotalQueryableSamples)
 				require.NotNil(t, qs.Samples.TotalQueryableSamplesPerStep)
+				require.GreaterOrEqual(t, qs.Samples.SamplesRead, int64(0))
+				require.NotNil(t, qs.Samples.SamplesReadPerStep)
 			},
 		},
 		{
@@ -1755,15 +1775,11 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 			errType:  errorBadData,
 		},
 		{
-			endpoint: api.dropSeries,
-			errType:  errorInternal,
-		},
-		{
 			endpoint: api.targets,
 			response: &TargetDiscovery{
 				ActiveTargets: []*Target{
 					{
-						DiscoveredLabels:   labels.FromStrings("__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "blackbox"),
 						ScrapePool:         "blackbox",
 						ScrapeURL:          "http://localhost:9115/probe?target=example.com",
@@ -1776,7 +1792,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 						ScrapeTimeout:      "10s",
 					},
 					{
-						DiscoveredLabels:   labels.FromStrings("__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "test"),
 						ScrapePool:         "test",
 						ScrapeURL:          "http://example.com:8080/metrics",
@@ -1793,10 +1809,13 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 					{
 						DiscoveredLabels: labels.FromStrings(
 							"__address__", "http://dropped.example.com:9115",
+							"__always_scrape_classic_histograms__", "false",
+							"__convert_classic_histograms_to_nhcb__", "false",
 							"__metrics_path__", "/probe",
 							"__scheme__", "http",
 							"job", "blackbox",
 							"__scrape_interval__", "30s",
+							"__scrape_native_histograms__", "false",
 							"__scrape_timeout__", "15s",
 						),
 						ScrapePool: "blackbox",
@@ -1813,7 +1832,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 			response: &TargetDiscovery{
 				ActiveTargets: []*Target{
 					{
-						DiscoveredLabels:   labels.FromStrings("__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "blackbox"),
 						ScrapePool:         "blackbox",
 						ScrapeURL:          "http://localhost:9115/probe?target=example.com",
@@ -1826,7 +1845,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 						ScrapeTimeout:      "10s",
 					},
 					{
-						DiscoveredLabels:   labels.FromStrings("__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "test"),
 						ScrapePool:         "test",
 						ScrapeURL:          "http://example.com:8080/metrics",
@@ -1843,10 +1862,13 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 					{
 						DiscoveredLabels: labels.FromStrings(
 							"__address__", "http://dropped.example.com:9115",
+							"__always_scrape_classic_histograms__", "false",
+							"__convert_classic_histograms_to_nhcb__", "false",
 							"__metrics_path__", "/probe",
 							"__scheme__", "http",
 							"job", "blackbox",
 							"__scrape_interval__", "30s",
+							"__scrape_native_histograms__", "false",
 							"__scrape_timeout__", "15s",
 						),
 						ScrapePool: "blackbox",
@@ -1863,7 +1885,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 			response: &TargetDiscovery{
 				ActiveTargets: []*Target{
 					{
-						DiscoveredLabels:   labels.FromStrings("__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__param_target", "example.com", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "blackbox"),
 						ScrapePool:         "blackbox",
 						ScrapeURL:          "http://localhost:9115/probe?target=example.com",
@@ -1876,7 +1898,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 						ScrapeTimeout:      "10s",
 					},
 					{
-						DiscoveredLabels:   labels.FromStrings("__scrape_interval__", "0s", "__scrape_timeout__", "0s"),
+						DiscoveredLabels:   labels.FromStrings("__always_scrape_classic_histograms__", "false", "__convert_classic_histograms_to_nhcb__", "false", "__scrape_interval__", "0s", "__scrape_native_histograms__", "false", "__scrape_timeout__", "0s"),
 						Labels:             labels.FromStrings("job", "test"),
 						ScrapePool:         "test",
 						ScrapeURL:          "http://example.com:8080/metrics",
@@ -1903,10 +1925,13 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 					{
 						DiscoveredLabels: labels.FromStrings(
 							"__address__", "http://dropped.example.com:9115",
+							"__always_scrape_classic_histograms__", "false",
+							"__convert_classic_histograms_to_nhcb__", "false",
 							"__metrics_path__", "/probe",
 							"__scheme__", "http",
 							"job", "blackbox",
 							"__scrape_interval__", "30s",
+							"__scrape_native_histograms__", "false",
 							"__scrape_timeout__", "15s",
 						),
 						ScrapePool: "blackbox",
@@ -3792,7 +3817,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 			r.RemoteAddr = "127.0.0.1:20201"
 			return r, err
 		}
-		r, err := http.NewRequest(m, fmt.Sprintf("http://example.com?%s", q.Encode()), nil)
+		r, err := http.NewRequest(m, fmt.Sprintf("http://example.com?%s", q.Encode()), http.NoBody)
 		r.RemoteAddr = "127.0.0.1:20201"
 		return r, err
 	}
@@ -4101,10 +4126,11 @@ func TestAdminEndpoints(t *testing.T) {
 				dbDir:       dir,
 				ready:       func(f http.HandlerFunc) http.HandlerFunc { return f },
 				enableAdmin: tc.enableAdmin,
+				parser:      testParser,
 			}
 
 			endpoint := tc.endpoint(api)
-			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), nil)
+			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), http.NoBody)
 			require.NoError(t, err)
 
 			res := setUnavailStatusOnTSDBNotReady(endpoint(req))
@@ -4184,7 +4210,7 @@ func TestRespondSuccess(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodGet, s.URL, nil)
+			req, err := http.NewRequest(http.MethodGet, s.URL, http.NoBody)
 			require.NoError(t, err)
 
 			if tc.acceptHeader != "" {
@@ -4218,7 +4244,7 @@ func TestRespondSuccess_DefaultCodecCannotEncodeResponse(t *testing.T) {
 	}))
 	defer s.Close()
 
-	req, err := http.NewRequest(http.MethodGet, s.URL, nil)
+	req, err := http.NewRequest(http.MethodGet, s.URL, http.NoBody)
 	require.NoError(t, err)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -4251,7 +4277,7 @@ func TestServeTSDBBlocks(t *testing.T) {
 		db: db,
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/status/tsdb/blocks", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status/tsdb/blocks", http.NoBody)
 	w := httptest.NewRecorder()
 
 	result := api.serveTSDBBlocks(req)
@@ -4339,7 +4365,7 @@ func TestParseTimeParam(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		req, err := http.NewRequest(http.MethodGet, "localhost:42/foo?"+test.paramName+"="+test.paramValue, nil)
+		req, err := http.NewRequest(http.MethodGet, "localhost:42/foo?"+test.paramName+"="+test.paramValue, http.NoBody)
 		require.NoError(t, err)
 
 		result := test.result
@@ -4476,7 +4502,7 @@ func TestOptionsMethod(t *testing.T) {
 	s := httptest.NewServer(r)
 	defer s.Close()
 
-	req, err := http.NewRequest(http.MethodOptions, s.URL+"/any_path", nil)
+	req, err := http.NewRequest(http.MethodOptions, s.URL+"/any_path", http.NoBody)
 	require.NoError(t, err, "Error creating OPTIONS request")
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -4530,12 +4556,80 @@ func TestTSDBStatus(t *testing.T) {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			api := &API{db: tc.db, gatherer: prometheus.DefaultGatherer}
 			endpoint := tc.endpoint(api)
-			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), nil)
+			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), http.NoBody)
 			require.NoError(t, err, "Error when creating test request")
 			res := endpoint(req)
 			assertAPIError(t, res.err, tc.errType)
 		})
 	}
+}
+
+func TestSelfMetrics(t *testing.T) {
+	api := &API{gatherer: prometheus.DefaultGatherer}
+
+	t.Run("returns all metrics without filter", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "", http.NoBody)
+		require.NoError(t, err)
+		res := api.selfMetrics(req)
+		assertAPIError(t, res.err, errorNone)
+		families, ok := res.data.([]json.RawMessage)
+		require.True(t, ok, "expected []json.RawMessage")
+		require.NotEmpty(t, families, "expected at least one metric family from default gatherer")
+	})
+
+	t.Run("filters metrics by regex", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "?metric_name_pattern=go_.*", http.NoBody)
+		require.NoError(t, err)
+		req.Form = url.Values{"metric_name_pattern": {"go_.*"}}
+		res := api.selfMetrics(req)
+		assertAPIError(t, res.err, errorNone)
+		families, ok := res.data.([]json.RawMessage)
+		require.True(t, ok, "expected []json.RawMessage")
+		require.NotEmpty(t, families)
+		for _, raw := range families {
+			var f map[string]any
+			require.NoError(t, json.Unmarshal(raw, &f))
+			name, _ := f["name"].(string)
+			require.True(t, strings.HasPrefix(name, "go_"), "expected metric name to start with 'go_', got %q", name)
+		}
+	})
+
+	t.Run("non-matching pattern returns empty", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "?metric_name_pattern=nonexistent_prefix_xyz_", http.NoBody)
+		require.NoError(t, err)
+		req.Form = url.Values{"metric_name_pattern": {"nonexistent_prefix_xyz_"}}
+		res := api.selfMetrics(req)
+		assertAPIError(t, res.err, errorNone)
+		families, ok := res.data.([]json.RawMessage)
+		require.True(t, ok, "expected []json.RawMessage")
+		require.Empty(t, families)
+	})
+
+	t.Run("invalid regex returns error", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "?metric_name_pattern=[invalid", http.NoBody)
+		require.NoError(t, err)
+		req.Form = url.Values{"metric_name_pattern": {"[invalid"}}
+		res := api.selfMetrics(req)
+		assertAPIError(t, res.err, errorBadData)
+	})
+
+	t.Run("metric families have expected ProtoJSON structure", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, "", http.NoBody)
+		require.NoError(t, err)
+		res := api.selfMetrics(req)
+		assertAPIError(t, res.err, errorNone)
+		families := res.data.([]json.RawMessage)
+		for _, raw := range families {
+			var f map[string]any
+			require.NoError(t, json.Unmarshal(raw, &f))
+			name, _ := f["name"].(string)
+			require.NotEmpty(t, name, "metric family name should not be empty")
+			typ, _ := f["type"].(string)
+			require.NotEmpty(t, typ, "metric family type should not be empty")
+			metrics, _ := f["metric"].([]any)
+			require.NotEmpty(t, metrics, "metric family %q should have at least one metric", name)
+		}
+	})
 }
 
 func TestReturnAPIError(t *testing.T) {
@@ -4623,7 +4717,7 @@ func BenchmarkRespond(b *testing.B) {
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
 			b.ReportAllocs()
-			request, err := http.NewRequest(http.MethodGet, "/does-not-matter", nil)
+			request, err := http.NewRequest(http.MethodGet, "/does-not-matter", http.NoBody)
 			require.NoError(b, err)
 			b.ResetTimer()
 			api := API{}
@@ -4850,6 +4944,7 @@ func TestQueryTimeout(t *testing.T) {
 				now:                   func() time.Time { return now },
 				config:                func() config.Config { return samplePrometheusCfg },
 				ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
+				parser:                testParser,
 			}
 
 			query := url.Values{
@@ -4857,7 +4952,7 @@ func TestQueryTimeout(t *testing.T) {
 				"timeout": []string{"1s"},
 			}
 			ctx := context.Background()
-			req, err := http.NewRequest(tc.method, fmt.Sprintf("http://example.com?%s", query.Encode()), nil)
+			req, err := http.NewRequest(tc.method, fmt.Sprintf("http://example.com?%s", query.Encode()), http.NoBody)
 			require.NoError(t, err)
 			req.RemoteAddr = "127.0.0.1:20201"
 
@@ -4914,4 +5009,32 @@ func (*fakeQuery) Cancel() {}
 
 func (q *fakeQuery) String() string {
 	return q.query
+}
+
+// TestDeleteSeriesEndpointRemoved verifies that the deprecated DELETE /api/v1/series
+// endpoint is no longer registered and does not return HTTP 500 "not implemented".
+func TestDeleteSeriesEndpointRemoved(t *testing.T) {
+	api := newTestAPI(t, testhelpers.APIConfig{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/series", http.NoBody)
+	recorder := httptest.NewRecorder()
+	api.Handler.ServeHTTP(recorder, req)
+
+	// The endpoint previously returned HTTP 500 with "not implemented".
+	// After removal, the router should no longer match DELETE on /series,
+	// so we must not get the old 500 error.
+	require.NotEqual(t, http.StatusInternalServerError, recorder.Code,
+		"DELETE /api/v1/series should no longer return 500; the endpoint has been removed")
+}
+
+func TestGetRuleGroupNextToken(t *testing.T) {
+	// The token is a SHA-256 hex digest, so it must be deterministic and 64
+	// characters long.
+	token := getRuleGroupNextToken("/path/to/file", "group")
+	require.Len(t, token, hex.EncodedLen(sha256.Size))
+	require.Equal(t, token, getRuleGroupNextToken("/path/to/file", "group"))
+
+	// Distinct file and group inputs must produce distinct tokens.
+	require.NotEqual(t, token, getRuleGroupNextToken("/path/to/file", "other"))
+	require.NotEqual(t, token, getRuleGroupNextToken("/other/file", "group"))
 }

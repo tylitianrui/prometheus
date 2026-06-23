@@ -36,6 +36,7 @@ type mskDataStore struct {
 }
 
 func TestMSKDiscoveryListClusters(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	for _, tt := range []struct {
@@ -126,6 +127,7 @@ func TestMSKDiscoveryListClusters(t *testing.T) {
 }
 
 func TestMSKDiscoveryDescribeClusters(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	for _, tt := range []struct {
@@ -218,7 +220,8 @@ func TestMSKDiscoveryDescribeClusters(t *testing.T) {
 			d := &MSKDiscovery{
 				msk: client,
 				cfg: &MSKSDConfig{
-					Region: tt.mskData.region,
+					Region:             tt.mskData.region,
+					RequestConcurrency: 10,
 				},
 			}
 
@@ -239,13 +242,14 @@ func TestMSKDiscoveryDescribeClusters(t *testing.T) {
 }
 
 func TestMSKDiscoveryListNodes(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	for _, tt := range []struct {
-		name       string
-		mskData    *mskDataStore
-		clusterARN string
-		expected   []types.NodeInfo
+		name     string
+		mskData  *mskDataStore
+		clusters []types.Cluster
+		expected map[string][]types.NodeInfo
 	}{
 		{
 			name: "ClusterWithBrokers",
@@ -280,30 +284,36 @@ func TestMSKDiscoveryListNodes(t *testing.T) {
 					},
 				},
 			},
-			clusterARN: "arn:aws:kafka:us-west-2:123456789012:cluster/test-cluster/abc-123",
-			expected: []types.NodeInfo{
+			clusters: []types.Cluster{
 				{
-					NodeARN:            strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-1"),
-					AddedToClusterTime: strptr("2023-01-01T00:00:00Z"),
-					InstanceType:       strptr("kafka.m5.large"),
-					BrokerNodeInfo: &types.BrokerNodeInfo{
-						BrokerId:           aws.Float64(1),
-						ClientSubnet:       strptr("subnet-12345"),
-						ClientVpcIpAddress: strptr("10.0.1.100"),
-						Endpoints:          []string{"b-1.test-cluster.abc123.kafka.us-west-2.amazonaws.com"},
-						AttachedENIId:      strptr("eni-12345"),
-					},
+					ClusterArn: strptr("arn:aws:kafka:us-west-2:123456789012:cluster/test-cluster/abc-123"),
 				},
-				{
-					NodeARN:            strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-2"),
-					AddedToClusterTime: strptr("2023-01-01T00:00:00Z"),
-					InstanceType:       strptr("kafka.m5.large"),
-					BrokerNodeInfo: &types.BrokerNodeInfo{
-						BrokerId:           aws.Float64(2),
-						ClientSubnet:       strptr("subnet-67890"),
-						ClientVpcIpAddress: strptr("10.0.1.101"),
-						Endpoints:          []string{"b-2.test-cluster.abc123.kafka.us-west-2.amazonaws.com"},
-						AttachedENIId:      strptr("eni-67890"),
+			},
+			expected: map[string][]types.NodeInfo{
+				"arn:aws:kafka:us-west-2:123456789012:cluster/test-cluster/abc-123": {
+					{
+						NodeARN:            strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-1"),
+						AddedToClusterTime: strptr("2023-01-01T00:00:00Z"),
+						InstanceType:       strptr("kafka.m5.large"),
+						BrokerNodeInfo: &types.BrokerNodeInfo{
+							BrokerId:           aws.Float64(1),
+							ClientSubnet:       strptr("subnet-12345"),
+							ClientVpcIpAddress: strptr("10.0.1.100"),
+							Endpoints:          []string{"b-1.test-cluster.abc123.kafka.us-west-2.amazonaws.com"},
+							AttachedENIId:      strptr("eni-12345"),
+						},
+					},
+					{
+						NodeARN:            strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-2"),
+						AddedToClusterTime: strptr("2023-01-01T00:00:00Z"),
+						InstanceType:       strptr("kafka.m5.large"),
+						BrokerNodeInfo: &types.BrokerNodeInfo{
+							BrokerId:           aws.Float64(2),
+							ClientSubnet:       strptr("subnet-67890"),
+							ClientVpcIpAddress: strptr("10.0.1.101"),
+							Endpoints:          []string{"b-2.test-cluster.abc123.kafka.us-west-2.amazonaws.com"},
+							AttachedENIId:      strptr("eni-67890"),
+						},
 					},
 				},
 			},
@@ -316,8 +326,68 @@ func TestMSKDiscoveryListNodes(t *testing.T) {
 					"arn:aws:kafka:us-west-2:123456789012:cluster/empty-cluster/xyz-789": {},
 				},
 			},
-			clusterARN: "arn:aws:kafka:us-west-2:123456789012:cluster/empty-cluster/xyz-789",
-			expected:   nil,
+			clusters: []types.Cluster{
+				{
+					ClusterArn: strptr("arn:aws:kafka:us-west-2:123456789012:cluster/empty-cluster/xyz-789"),
+				},
+			},
+			expected: map[string][]types.NodeInfo{
+				"arn:aws:kafka:us-west-2:123456789012:cluster/empty-cluster/xyz-789": nil,
+			},
+		},
+		{
+			name: "MultipleClusters",
+			mskData: &mskDataStore{
+				region: "us-west-2",
+				nodes: map[string][]types.NodeInfo{
+					"arn:aws:kafka:us-west-2:123456789012:cluster/cluster-1/abc-123": {
+						{
+							NodeARN:      strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-1"),
+							InstanceType: strptr("kafka.m5.large"),
+							BrokerNodeInfo: &types.BrokerNodeInfo{
+								BrokerId: aws.Float64(1),
+							},
+						},
+					},
+					"arn:aws:kafka:us-west-2:123456789012:cluster/cluster-2/def-456": {
+						{
+							NodeARN:      strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-2"),
+							InstanceType: strptr("kafka.m5.xlarge"),
+							BrokerNodeInfo: &types.BrokerNodeInfo{
+								BrokerId: aws.Float64(2),
+							},
+						},
+					},
+				},
+			},
+			clusters: []types.Cluster{
+				{
+					ClusterArn: strptr("arn:aws:kafka:us-west-2:123456789012:cluster/cluster-1/abc-123"),
+				},
+				{
+					ClusterArn: strptr("arn:aws:kafka:us-west-2:123456789012:cluster/cluster-2/def-456"),
+				},
+			},
+			expected: map[string][]types.NodeInfo{
+				"arn:aws:kafka:us-west-2:123456789012:cluster/cluster-1/abc-123": {
+					{
+						NodeARN:      strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-1"),
+						InstanceType: strptr("kafka.m5.large"),
+						BrokerNodeInfo: &types.BrokerNodeInfo{
+							BrokerId: aws.Float64(1),
+						},
+					},
+				},
+				"arn:aws:kafka:us-west-2:123456789012:cluster/cluster-2/def-456": {
+					{
+						NodeARN:      strptr("arn:aws:kafka:us-west-2:123456789012:node/broker-2"),
+						InstanceType: strptr("kafka.m5.xlarge"),
+						BrokerNodeInfo: &types.BrokerNodeInfo{
+							BrokerId: aws.Float64(2),
+						},
+					},
+				},
+			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -326,11 +396,12 @@ func TestMSKDiscoveryListNodes(t *testing.T) {
 			d := &MSKDiscovery{
 				msk: client,
 				cfg: &MSKSDConfig{
-					Region: tt.mskData.region,
+					Region:             tt.mskData.region,
+					RequestConcurrency: 10,
 				},
 			}
 
-			nodes, err := d.listNodes(ctx, tt.clusterARN)
+			nodes, err := d.listNodes(ctx, tt.clusters)
 			require.NoError(t, err)
 			require.Equal(t, tt.expected, nodes)
 		})
@@ -338,6 +409,7 @@ func TestMSKDiscoveryListNodes(t *testing.T) {
 }
 
 func TestMSKDiscoveryRefresh(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 
 	tests := []struct {
@@ -398,9 +470,10 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				},
 			},
 			config: &MSKSDConfig{
-				Region:   "us-west-2",
-				Port:     80,
-				Clusters: []string{"arn:aws:kafka:us-west-2:123456789012:cluster/test-cluster/abc-123"},
+				Region:             "us-west-2",
+				Port:               80,
+				RequestConcurrency: 10,
+				Clusters:           []string{"arn:aws:kafka:us-west-2:123456789012:cluster/test-cluster/abc-123"},
 			},
 			expected: []*targetgroup.Group{
 				{
@@ -441,9 +514,10 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				clusters: []types.Cluster{},
 			},
 			config: &MSKSDConfig{
-				Region:   "us-east-1",
-				Port:     80,
-				Clusters: []string{}, // Empty clusters list uses listClusters
+				Region:             "us-east-1",
+				Port:               80,
+				RequestConcurrency: 10,
+				Clusters:           []string{}, // Empty clusters list uses listClusters
 			},
 			expected: []*targetgroup.Group{
 				{
@@ -499,9 +573,10 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				},
 			},
 			config: &MSKSDConfig{
-				Region:   "us-west-2",
-				Port:     80,
-				Clusters: nil, // nil clusters list uses listClusters (backward compatibility)
+				Region:             "us-west-2",
+				Port:               80,
+				RequestConcurrency: 10,
+				Clusters:           nil, // nil clusters list uses listClusters (backward compatibility)
 			},
 			expected: []*targetgroup.Group{
 				{
@@ -612,9 +687,10 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				},
 			},
 			config: &MSKSDConfig{
-				Region:   "us-west-2",
-				Port:     80,
-				Clusters: []string{"arn:aws:kafka:us-west-2:123456789012:cluster/kraft-cluster/xyz-789"},
+				Region:             "us-west-2",
+				Port:               80,
+				RequestConcurrency: 10,
+				Clusters:           []string{"arn:aws:kafka:us-west-2:123456789012:cluster/kraft-cluster/xyz-789"},
 			},
 			expected: []*targetgroup.Group{
 				{
@@ -764,9 +840,10 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 				},
 			},
 			config: &MSKSDConfig{
-				Region:   "us-east-1",
-				Port:     80,
-				Clusters: []string{"arn:aws:kafka:us-east-1:123456789012:cluster/multi-endpoint-cluster/abc-999"},
+				Region:             "us-east-1",
+				Port:               80,
+				RequestConcurrency: 10,
+				Clusters:           []string{"arn:aws:kafka:us-east-1:123456789012:cluster/multi-endpoint-cluster/abc-999"},
 			},
 			expected: []*targetgroup.Group{
 				{
@@ -922,8 +999,9 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 			if config == nil {
 				// Default config for backward compatibility
 				config = &MSKSDConfig{
-					Region: tt.mskData.region,
-					Port:   80,
+					Region:             tt.mskData.region,
+					Port:               80,
+					RequestConcurrency: 10,
 				}
 			}
 
@@ -957,6 +1035,7 @@ func TestMSKDiscoveryRefresh(t *testing.T) {
 }
 
 func TestNodeType(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		node     types.NodeInfo

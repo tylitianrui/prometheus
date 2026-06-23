@@ -17,6 +17,7 @@ import { PrometheusClient } from '../client';
 import {
   Add,
   AggregateExpr,
+  AggregateModifier,
   And,
   BinaryExpr,
   BoolModifier,
@@ -60,6 +61,8 @@ import {
   LimitK,
   LimitRatio,
   CountValues,
+  TrimLower,
+  TrimUpper,
 } from '@prometheus-io/lezer-promql';
 import { Completion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
 import { EditorState } from '@codemirror/state';
@@ -166,13 +169,28 @@ function arrayToCompletionResult(data: Completion[], from: number, to: number, i
   } as CompletionResult;
 }
 
+function escapePromQLString(str: string): string {
+  // PromQL only evaluates escape sequences in single- and double-quoted strings.
+  // Backtick-quoted string completions are not handled separately today, so keep
+  // the inserted value escaped unconditionally.
+  return str.replace(/([\\"])/g, '\\$1');
+}
+
+function isAfterClosedFunctionCallBody(state: EditorState, node: SyntaxNode, pos: number): boolean {
+  return node.type.id === FunctionCallBody && pos >= node.to && node.from < node.to && state.sliceDoc(node.to - 1, node.to) === ')';
+}
+
 // computeEndCompletePosition calculates the end position for autocompletion replacement.
 // When the cursor is in the middle of a token, this ensures the entire token is replaced,
 // not just the portion before the cursor. This fixes issue #15839.
 // Note: this method is exported only for testing purpose.
-export function computeEndCompletePosition(node: SyntaxNode, pos: number): number {
+export function computeEndCompletePosition(state: EditorState, node: SyntaxNode, pos: number): number {
   // For error nodes, use the cursor position as the end position
   if (node.type.id === 0) {
+    return pos;
+  }
+
+  if (isAfterClosedFunctionCallBody(state, node, pos)) {
     return pos;
   }
 
@@ -231,7 +249,9 @@ function computeStartCompleteLabelPositionInLabelMatcherOrInGroupingLabel(node: 
 export function computeStartCompletePosition(state: EditorState, node: SyntaxNode, pos: number): number {
   const currentText = state.doc.slice(node.from, pos).toString();
   let start = node.from;
-  if (node.type.id === LabelMatchers || node.type.id === GroupingLabels) {
+  if (isAfterClosedFunctionCallBody(state, node, pos)) {
+    start = pos;
+  } else if (node.type.id === LabelMatchers || node.type.id === GroupingLabels) {
     start = computeStartCompleteLabelPositionInLabelMatcherOrInGroupingLabel(node, pos);
   } else if (
     (node.type.id === FunctionCallBody && node.firstChild === null) ||
@@ -536,6 +556,13 @@ export function analyzeCompletion(state: EditorState, node: SyntaxNode, pos: num
       result.push({ kind: ContextKind.Duration });
       break;
     case FunctionCallBody:
+      if (isAfterClosedFunctionCallBody(state, node, pos)) {
+        if (node.parent?.type.id === AggregateExpr && !containsAtLeastOneChild(node.parent, AggregateModifier)) {
+          result.push({ kind: ContextKind.AggregateOpModifier });
+        }
+        result.push({ kind: ContextKind.BinOp });
+        break;
+      }
       // For aggregation function such as Topk, the first parameter is a number.
       // The second one is an expression.
       // When moving to the second parameter, the node is an error node.
@@ -579,6 +606,8 @@ export function analyzeCompletion(state: EditorState, node: SyntaxNode, pos: num
     case Eql:
     case Gte:
     case Gtr:
+    case TrimLower:
+    case TrimUpper:
     case Lte:
     case Lss:
     case And:
@@ -700,7 +729,7 @@ export class HybridComplete implements CompleteStrategy {
       return arrayToCompletionResult(
         result,
         computeStartCompletePosition(state, tree, pos),
-        computeEndCompletePosition(tree, pos),
+        computeEndCompletePosition(state, tree, pos),
         completeSnippet,
         span
       );
@@ -790,7 +819,7 @@ export class HybridComplete implements CompleteStrategy {
       return result;
     }
     return this.prometheusClient.labelValues(context.labelName, context.metricName, context.matchers).then((labelValues: string[]) => {
-      return result.concat(labelValues.map((value) => ({ label: value, type: 'text' })));
+      return result.concat(labelValues.map((value) => ({ label: value, apply: escapePromQLString(value), type: 'text' })));
     });
   }
 }

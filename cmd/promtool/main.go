@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -61,7 +62,11 @@ import (
 	"github.com/prometheus/prometheus/util/documentcli"
 )
 
-var promqlEnableDelayedNameRemoval = false
+var (
+	promqlEnableDelayedNameRemoval = false
+	promtoolParserOpts             parser.Options
+	logger                         = promslog.New(&promslog.Config{})
+)
 
 func init() {
 	// This can be removed when the legacy global mode is fully deprecated.
@@ -177,6 +182,7 @@ func main() {
 	queryInstantCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&serverURL)
 	queryInstantExpr := queryInstantCmd.Arg("expr", "PromQL query expression.").Required().String()
 	queryInstantTime := queryInstantCmd.Flag("time", "Query evaluation time (RFC3339 or Unix timestamp).").String()
+	queryInstantHeaders := queryInstantCmd.Flag("header", "Extra headers to send to server.").StringMap()
 
 	queryRangeCmd := queryCmd.Command("range", "Run range query.")
 	queryRangeCmd.Arg("server", "Prometheus server to query.").Required().URLVar(&serverURL)
@@ -314,7 +320,7 @@ func main() {
 	promQLLabelsDeleteQuery := promQLLabelsDeleteCmd.Arg("query", "PromQL query.").Required().String()
 	promQLLabelsDeleteName := promQLLabelsDeleteCmd.Arg("name", "Name of the label to delete.").Required().String()
 
-	featureList := app.Flag("enable-feature", "Comma separated feature names to enable. Valid options: promql-experimental-functions, promql-delayed-name-removal. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details").Default("").Strings()
+	featureList := app.Flag("enable-feature", "Comma separated feature names to enable. Valid options: promql-experimental-functions, promql-delayed-name-removal, promql-duration-expr, promql-extended-range-selectors. See https://prometheus.io/docs/prometheus/latest/feature_flags/ for more details").Default("").Strings()
 
 	documentationCmd := app.Command("write-documentation", "Generate command line documentation. Internal use.").Hidden()
 
@@ -348,9 +354,13 @@ func main() {
 		for o := range strings.SplitSeq(f, ",") {
 			switch o {
 			case "promql-experimental-functions":
-				parser.EnableExperimentalFunctions = true
+				promtoolParserOpts.EnableExperimentalFunctions = true
 			case "promql-delayed-name-removal":
 				promqlEnableDelayedNameRemoval = true
+			case "promql-duration-expr":
+				promtoolParserOpts.ExperimentalDurationExpr = true
+			case "promql-extended-range-selectors":
+				promtoolParserOpts.EnableExtendedRangeSelectors = true
 			case "":
 				continue
 			default:
@@ -358,13 +368,14 @@ func main() {
 			}
 		}
 	}
+	promtoolParser := parser.NewParser(promtoolParserOpts)
 
 	switch parsedCmd {
 	case sdCheckCmd.FullCommand():
 		os.Exit(CheckSD(*sdConfigFile, *sdJobName, *sdTimeout, prometheus.DefaultRegisterer))
 
 	case checkConfigCmd.FullCommand():
-		os.Exit(CheckConfig(*agentMode, *checkConfigSyntaxOnly, newConfigLintConfig(*checkConfigLint, *checkConfigLintFatal, *checkConfigIgnoreUnknownFields, model.UTF8Validation, model.Duration(*checkLookbackDelta)), *configFiles...))
+		os.Exit(CheckConfig(*agentMode, *checkConfigSyntaxOnly, newConfigLintConfig(*checkConfigLint, *checkConfigLintFatal, *checkConfigIgnoreUnknownFields, model.UTF8Validation, model.Duration(*checkLookbackDelta)), promtoolParser, *configFiles...))
 
 	case checkServerHealthCmd.FullCommand():
 		os.Exit(checkErr(CheckServerStatus(serverURL, checkHealth, httpRoundTripper)))
@@ -376,7 +387,7 @@ func main() {
 		os.Exit(CheckWebConfig(*webConfigFiles...))
 
 	case checkRulesCmd.FullCommand():
-		os.Exit(CheckRules(newRulesLintConfig(*checkRulesLint, *checkRulesLintFatal, *checkRulesIgnoreUnknownFields, model.UTF8Validation), *ruleFiles...))
+		os.Exit(CheckRules(newRulesLintConfig(*checkRulesLint, *checkRulesLintFatal, *checkRulesIgnoreUnknownFields, model.UTF8Validation), promtoolParser, *ruleFiles...))
 
 	case checkMetricsCmd.FullCommand():
 		os.Exit(CheckMetrics(*checkMetricsExtended, *checkMetricsLint))
@@ -385,7 +396,7 @@ func main() {
 		os.Exit(PushMetrics(remoteWriteURL, httpRoundTripper, *pushMetricsHeaders, *pushMetricsTimeout, *pushMetricsProtoMsg, *pushMetricsLabels, *metricFiles...))
 
 	case queryInstantCmd.FullCommand():
-		os.Exit(QueryInstant(serverURL, httpRoundTripper, *queryInstantExpr, *queryInstantTime, p))
+		os.Exit(QueryInstant(serverURL, httpRoundTripper, *queryInstantHeaders, *queryInstantExpr, *queryInstantTime, p))
 
 	case queryRangeCmd.FullCommand():
 		os.Exit(QueryRange(serverURL, httpRoundTripper, *queryRangeHeaders, *queryRangeExpr, *queryRangeBegin, *queryRangeEnd, *queryRangeStep, p))
@@ -416,6 +427,7 @@ func main() {
 				EnableNegativeOffset:     true,
 				EnableDelayedNameRemoval: promqlEnableDelayedNameRemoval,
 			},
+			promtoolParser,
 			*testRulesRun,
 			*testRulesDiff,
 			*testRulesDebug,
@@ -427,7 +439,7 @@ func main() {
 		os.Exit(checkErr(benchmarkWrite(*benchWriteOutPath, *benchSamplesFile, *benchWriteNumMetrics, *benchWriteNumScrapes)))
 
 	case tsdbAnalyzeCmd.FullCommand():
-		os.Exit(checkErr(analyzeBlock(ctx, *analyzePath, *analyzeBlockID, *analyzeLimit, *analyzeRunExtended, *analyzeMatchers)))
+		os.Exit(checkErr(analyzeBlock(ctx, *analyzePath, *analyzeBlockID, *analyzeLimit, *analyzeRunExtended, *analyzeMatchers, promtoolParser)))
 
 	case tsdbListCmd.FullCommand():
 		os.Exit(checkErr(listBlocks(*listPath, *listHumanReadable)))
@@ -437,10 +449,10 @@ func main() {
 		if *dumpFormat == "seriesjson" {
 			format = formatSeriesSetLabelsToJSON
 		}
-		os.Exit(checkErr(dumpTSDBData(ctx, *dumpPath, *dumpSandboxDirRoot, *dumpMinTime, *dumpMaxTime, *dumpMatch, format)))
+		os.Exit(checkErr(dumpTSDBData(ctx, *dumpPath, *dumpSandboxDirRoot, *dumpMinTime, *dumpMaxTime, *dumpMatch, format, promtoolParser)))
 
 	case tsdbDumpOpenMetricsCmd.FullCommand():
-		os.Exit(checkErr(dumpTSDBData(ctx, *dumpOpenMetricsPath, *dumpOpenMetricsSandboxDirRoot, *dumpOpenMetricsMinTime, *dumpOpenMetricsMaxTime, *dumpOpenMetricsMatch, formatSeriesSetOpenMetrics)))
+		os.Exit(checkErr(dumpTSDBData(ctx, *dumpOpenMetricsPath, *dumpOpenMetricsSandboxDirRoot, *dumpOpenMetricsMinTime, *dumpOpenMetricsMaxTime, *dumpOpenMetricsMatch, formatSeriesSetOpenMetrics, promtoolParser)))
 	// TODO(aSquare14): Work on adding support for custom block size.
 	case openMetricsImportCmd.FullCommand():
 		os.Exit(backfillOpenMetrics(*importFilePath, *importDBPath, *importHumanReadable, *importQuiet, *maxBlockDuration, *openMetricsLabels))
@@ -456,15 +468,15 @@ func main() {
 
 	case promQLFormatCmd.FullCommand():
 		checkExperimental(*experimental)
-		os.Exit(checkErr(formatPromQL(*promQLFormatQuery)))
+		os.Exit(checkErr(formatPromQL(*promQLFormatQuery, promtoolParser)))
 
 	case promQLLabelsSetCmd.FullCommand():
 		checkExperimental(*experimental)
-		os.Exit(checkErr(labelsSetPromQL(*promQLLabelsSetQuery, *promQLLabelsSetType, *promQLLabelsSetName, *promQLLabelsSetValue)))
+		os.Exit(checkErr(labelsSetPromQL(*promQLLabelsSetQuery, *promQLLabelsSetType, *promQLLabelsSetName, *promQLLabelsSetValue, promtoolParser)))
 
 	case promQLLabelsDeleteCmd.FullCommand():
 		checkExperimental(*experimental)
-		os.Exit(checkErr(labelsDeletePromQL(*promQLLabelsDeleteQuery, *promQLLabelsDeleteName)))
+		os.Exit(checkErr(labelsDeletePromQL(*promQLLabelsDeleteQuery, *promQLLabelsDeleteName, promtoolParser)))
 	}
 }
 
@@ -557,8 +569,11 @@ func CheckServerStatus(serverURL *url.URL, checkEndpoint string, roundTripper ht
 		serverURL.Scheme = "http"
 	}
 
+	// Join the endpoint onto the server URL path so that a trailing slash in
+	// the user-provided URL does not result in a doubled slash (e.g.
+	// "//-/healthy"), which the Prometheus router does not match.
 	config := api.Config{
-		Address:      serverURL.String() + checkEndpoint,
+		Address:      serverURL.JoinPath(checkEndpoint).String(),
 		RoundTripper: roundTripper,
 	}
 
@@ -569,7 +584,7 @@ func CheckServerStatus(serverURL *url.URL, checkEndpoint string, roundTripper ht
 		return err
 	}
 
-	request, err := http.NewRequest(http.MethodGet, config.Address, nil)
+	request, err := http.NewRequest(http.MethodGet, config.Address, http.NoBody)
 	if err != nil {
 		return err
 	}
@@ -589,7 +604,7 @@ func CheckServerStatus(serverURL *url.URL, checkEndpoint string, roundTripper ht
 }
 
 // CheckConfig validates configuration files.
-func CheckConfig(agentMode, checkSyntaxOnly bool, lintSettings configLintConfig, files ...string) int {
+func CheckConfig(agentMode, checkSyntaxOnly bool, lintSettings configLintConfig, p parser.Parser, files ...string) int {
 	failed := false
 	hasErrors := false
 
@@ -610,7 +625,7 @@ func CheckConfig(agentMode, checkSyntaxOnly bool, lintSettings configLintConfig,
 		if !checkSyntaxOnly {
 			scrapeConfigsFailed := lintScrapeConfigs(scrapeConfigs, lintSettings)
 			failed = failed || scrapeConfigsFailed
-			rulesFailed, rulesHaveErrors := checkRules(ruleFiles, lintSettings.rulesLintConfig)
+			rulesFailed, rulesHaveErrors := checkRules(ruleFiles, lintSettings.rulesLintConfig, p, logger)
 			failed = failed || rulesFailed
 			hasErrors = hasErrors || rulesHaveErrors
 		}
@@ -654,7 +669,7 @@ func checkFileExists(fn string) error {
 func checkConfig(agentMode bool, filename string, checkSyntaxOnly bool) ([]string, []*config.ScrapeConfig, error) {
 	fmt.Println("Checking", filename)
 
-	cfg, err := config.LoadFile(filename, agentMode, promslog.NewNopLogger())
+	cfg, err := config.LoadFile(filename, agentMode, logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -779,10 +794,10 @@ func checkConfig(agentMode bool, filename string, checkSyntaxOnly bool) ([]strin
 }
 
 func checkTLSConfig(tlsConfig promconfig.TLSConfig, checkSyntaxOnly bool) error {
-	if len(tlsConfig.CertFile) > 0 && len(tlsConfig.KeyFile) == 0 {
+	if tlsConfig.CertFile != "" && tlsConfig.KeyFile == "" {
 		return fmt.Errorf("client cert file %q specified without client key file", tlsConfig.CertFile)
 	}
-	if len(tlsConfig.KeyFile) > 0 && len(tlsConfig.CertFile) == 0 {
+	if tlsConfig.KeyFile != "" && tlsConfig.CertFile == "" {
 		return fmt.Errorf("client key file %q specified without client cert file", tlsConfig.KeyFile)
 	}
 
@@ -837,13 +852,13 @@ func checkSDFile(filename string) ([]*targetgroup.Group, error) {
 }
 
 // CheckRules validates rule files.
-func CheckRules(ls rulesLintConfig, files ...string) int {
+func CheckRules(ls rulesLintConfig, p parser.Parser, files ...string) int {
 	failed := false
 	hasErrors := false
 	if len(files) == 0 {
-		failed, hasErrors = checkRulesFromStdin(ls)
+		failed, hasErrors = checkRulesFromStdin(ls, p, logger)
 	} else {
-		failed, hasErrors = checkRules(files, ls)
+		failed, hasErrors = checkRules(files, ls, p, logger)
 	}
 
 	if failed && hasErrors {
@@ -857,7 +872,7 @@ func CheckRules(ls rulesLintConfig, files ...string) int {
 }
 
 // checkRulesFromStdin validates rule from stdin.
-func checkRulesFromStdin(ls rulesLintConfig) (bool, bool) {
+func checkRulesFromStdin(ls rulesLintConfig, p parser.Parser, logger *slog.Logger) (bool, bool) {
 	failed := false
 	hasErrors := false
 	fmt.Println("Checking standard input")
@@ -866,7 +881,7 @@ func checkRulesFromStdin(ls rulesLintConfig) (bool, bool) {
 		fmt.Fprintln(os.Stderr, "  FAILED:", err)
 		return true, true
 	}
-	rgs, errs := rulefmt.Parse(data, ls.ignoreUnknownFields, ls.nameValidationScheme)
+	rgs, errs := rulefmt.Parse(data, ls.ignoreUnknownFields, ls.nameValidationScheme, p, logger)
 	if errs != nil {
 		failed = true
 		fmt.Fprintln(os.Stderr, "  FAILED:")
@@ -895,12 +910,12 @@ func checkRulesFromStdin(ls rulesLintConfig) (bool, bool) {
 }
 
 // checkRules validates rule files.
-func checkRules(files []string, ls rulesLintConfig) (bool, bool) {
+func checkRules(files []string, ls rulesLintConfig, p parser.Parser, logger *slog.Logger) (bool, bool) {
 	failed := false
 	hasErrors := false
 	for _, f := range files {
 		fmt.Println("Checking", f)
-		rgs, errs := rulefmt.ParseFile(f, ls.ignoreUnknownFields, ls.nameValidationScheme)
+		rgs, errs := rulefmt.ParseFile(f, ls.ignoreUnknownFields, ls.nameValidationScheme, p, logger)
 		if errs != nil {
 			failed = true
 			fmt.Fprintln(os.Stderr, "  FAILED:")
@@ -939,11 +954,11 @@ func checkRuleGroups(rgs *rulefmt.RuleGroups, lintSettings rulesLintConfig) (int
 		dRules := checkDuplicates(rgs.Groups)
 		if len(dRules) != 0 {
 			var errMessage strings.Builder
-			errMessage.WriteString(fmt.Sprintf("%d duplicate rule(s) found.\n", len(dRules)))
+			fmt.Fprintf(&errMessage, "%d duplicate rule(s) found.\n", len(dRules))
 			for _, n := range dRules {
-				errMessage.WriteString(fmt.Sprintf("Metric: %s\nLabel(s):\n", n.metric))
+				fmt.Fprintf(&errMessage, "Metric: %s\nLabel(s):\n", n.metric)
 				n.label.Range(func(l labels.Label) {
-					errMessage.WriteString(fmt.Sprintf("\t%s: %s\n", l.Name, l.Value))
+					fmt.Fprintf(&errMessage, "\t%s: %s\n", l.Name, l.Value)
 				})
 			}
 			errMessage.WriteString("Might cause inconsistency while recording expressions")
@@ -1297,7 +1312,7 @@ func importRules(url *url.URL, roundTripper http.RoundTripper, start, end, outpu
 		return fmt.Errorf("new api client error: %w", err)
 	}
 
-	ruleImporter := newRuleImporter(promslog.New(&promslog.Config{}), cfg, api)
+	ruleImporter := newRuleImporter(logger, cfg, api)
 	errs := ruleImporter.loadGroups(ctx, files)
 	for _, err := range errs {
 		if err != nil {
@@ -1341,8 +1356,8 @@ func checkTargetGroupsForScrapeConfig(targetGroups []*targetgroup.Group, scfg *c
 	return nil
 }
 
-func formatPromQL(query string) error {
-	expr, err := parser.ParseExpr(query)
+func formatPromQL(query string, p parser.Parser) error {
+	expr, err := p.ParseExpr(query)
 	if err != nil {
 		return err
 	}
@@ -1351,8 +1366,8 @@ func formatPromQL(query string) error {
 	return nil
 }
 
-func labelsSetPromQL(query, labelMatchType, name, value string) error {
-	expr, err := parser.ParseExpr(query)
+func labelsSetPromQL(query, labelMatchType, name, value string, p parser.Parser) error {
+	expr, err := p.ParseExpr(query)
 	if err != nil {
 		return err
 	}
@@ -1396,8 +1411,8 @@ func labelsSetPromQL(query, labelMatchType, name, value string) error {
 	return nil
 }
 
-func labelsDeletePromQL(query, name string) error {
-	expr, err := parser.ParseExpr(query)
+func labelsDeletePromQL(query, name string, p parser.Parser) error {
+	expr, err := p.ParseExpr(query)
 	if err != nil {
 		return err
 	}

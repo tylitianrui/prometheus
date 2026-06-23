@@ -15,7 +15,7 @@ package v1
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -41,6 +41,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
@@ -239,6 +240,9 @@ type API struct {
 	db                  TSDBAdminStats
 	dbDir               string
 	enableAdmin         bool
+	enableSearch        bool
+	maxSearchLimit      int
+	metaCache           *searchMetadataCache
 	logger              *slog.Logger
 	CORSOrigin          *regexp.Regexp
 	buildInfo           *PrometheusVersion
@@ -259,6 +263,8 @@ type API struct {
 
 	featureRegistry features.Collector
 	openAPIBuilder  *OpenAPIBuilder
+
+	parser parser.Parser
 }
 
 // NewAPI returns an initialized API type.
@@ -277,6 +283,8 @@ func NewAPI(
 	db TSDBAdminStats,
 	dbDir string,
 	enableAdmin bool,
+	enableSearch bool,
+	maxSearchLimit int,
 	logger *slog.Logger,
 	rr func(context.Context) RulesRetriever,
 	remoteReadSampleLimit int,
@@ -301,6 +309,7 @@ func NewAPI(
 	overrideErrorCode OverrideErrorCode,
 	featureRegistry features.Collector,
 	openAPIOptions OpenAPIOptions,
+	promqlParser parser.Parser,
 ) *API {
 	a := &API{
 		QueryEngine:       qe,
@@ -319,6 +328,9 @@ func NewAPI(
 		db:                  db,
 		dbDir:               dbDir,
 		enableAdmin:         enableAdmin,
+		enableSearch:        enableSearch,
+		maxSearchLimit:      maxSearchLimit,
+		metaCache:           &searchMetadataCache{},
 		rulesRetriever:      rr,
 		logger:              logger,
 		CORSOrigin:          corsOrigin,
@@ -332,8 +344,13 @@ func NewAPI(
 		overrideErrorCode:   overrideErrorCode,
 		featureRegistry:     featureRegistry,
 		openAPIBuilder:      NewOpenAPIBuilder(openAPIOptions, logger),
+		parser:              promqlParser,
 
 		remoteReadHandler: remote.NewReadHandler(logger, registerer, q, configFunc, remoteReadSampleLimit, remoteReadConcurrencyLimit, remoteReadMaxBytesInFrame),
+	}
+
+	if a.parser == nil {
+		a.parser = parser.NewParser(parser.Options{})
 	}
 
 	a.InstallCodec(JSONCodec{})
@@ -435,7 +452,6 @@ func (api *API) Register(r *route.Router) {
 
 	r.Get("/series", wrapAgent(api.series))
 	r.Post("/series", wrapAgent(api.series))
-	r.Del("/series", wrapAgent(api.dropSeries))
 
 	r.Get("/scrape_pools", wrap(api.scrapePools))
 	r.Get("/targets", wrap(api.targets))
@@ -451,6 +467,7 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/status/flags", wrap(api.serveFlags))
 	r.Get("/status/tsdb", wrapAgent(api.serveTSDBStatus))
 	r.Get("/status/tsdb/blocks", wrapAgent(api.serveTSDBBlocks))
+	r.Get("/status/self_metrics", wrap(api.selfMetrics))
 	r.Get("/features", wrap(api.features))
 	r.Get("/status/walreplay", api.serveWALReplayStatus)
 	r.Get("/notifications", api.notifications)
@@ -458,6 +475,14 @@ func (api *API) Register(r *route.Router) {
 	r.Post("/read", api.ready(api.remoteRead))
 	r.Post("/write", api.ready(api.remoteWrite))
 	r.Post("/otlp/v1/metrics", api.ready(api.otlpWrite))
+
+	// Search endpoints.
+	r.Get("/search/metric_names", api.ready(api.searchMetricNames))
+	r.Post("/search/metric_names", api.ready(api.searchMetricNames))
+	r.Get("/search/label_names", api.ready(api.searchLabelNames))
+	r.Post("/search/label_names", api.ready(api.searchLabelNames))
+	r.Get("/search/label_values", api.ready(api.searchLabelValues))
+	r.Post("/search/label_values", api.ready(api.searchLabelValues))
 
 	r.Get("/alerts", wrapAgent(api.alerts))
 	r.Get("/rules", wrapAgent(api.rules))
@@ -560,8 +585,8 @@ func (api *API) query(r *http.Request) (result apiFuncResult) {
 	}, nil, warnings, qry.Close}
 }
 
-func (*API) formatQuery(r *http.Request) (result apiFuncResult) {
-	expr, err := parser.ParseExpr(r.FormValue("query"))
+func (api *API) formatQuery(r *http.Request) (result apiFuncResult) {
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return invalidParamError(err, "query")
 	}
@@ -569,8 +594,8 @@ func (*API) formatQuery(r *http.Request) (result apiFuncResult) {
 	return apiFuncResult{expr.Pretty(0), nil, nil, nil}
 }
 
-func (*API) parseQuery(r *http.Request) apiFuncResult {
-	expr, err := parser.ParseExpr(r.FormValue("query"))
+func (api *API) parseQuery(r *http.Request) apiFuncResult {
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return invalidParamError(err, "query")
 	}
@@ -699,7 +724,7 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
-	expr, err := parser.ParseExpr(r.FormValue("query"))
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
@@ -762,7 +787,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
@@ -850,7 +875,7 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
@@ -969,7 +994,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return invalidParamError(err, "match[]")
 	}
@@ -1037,10 +1062,6 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 	}
 
 	return apiFuncResult{metrics, nil, warnings, closer}
-}
-
-func (*API) dropSeries(*http.Request) apiFuncResult {
-	return apiFuncResult{nil, &apiError{errorInternal, errors.New("not implemented")}, nil, nil}
 }
 
 // Target has the information for one target.
@@ -1264,7 +1285,7 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 	var matchers []*labels.Matcher
 	var err error
 	if matchTarget != "" {
-		matchers, err = parser.ParseMetricSelector(matchTarget)
+		matchers, err = api.parser.ParseMetricSelector(matchTarget)
 		if err != nil {
 			return invalidParamError(err, "match_target")
 		}
@@ -1583,7 +1604,7 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 	rgSet := queryFormToSet(r.Form["rule_group[]"])
 	fSet := queryFormToSet(r.Form["file[]"])
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
@@ -1773,7 +1794,7 @@ func parseListRulesPaginationRequest(r *http.Request) (int64, string, *apiFuncRe
 }
 
 func getRuleGroupNextToken(file, group string) string {
-	h := sha1.New()
+	h := sha256.New()
 	h.Write([]byte(file + ";" + group))
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -1862,6 +1883,38 @@ func TSDBStatsFromIndexStats(stats []index.Stat) []TSDBStat {
 	return result
 }
 
+func (api *API) selfMetrics(r *http.Request) apiFuncResult {
+	var nameFilter *regexp.Regexp
+	if pattern := r.FormValue("metric_name_pattern"); pattern != "" {
+		var err error
+		nameFilter, err = regexp.Compile("^(?:" + pattern + ")$")
+		if err != nil {
+			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("invalid metric_name_pattern: %w", err)}, nil, nil}
+		}
+	}
+
+	mfs, err := api.gatherer.Gather()
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error gathering self metrics: %w", err)}, nil, nil}
+	}
+
+	marshaler := protojson.MarshalOptions{}
+	result := make([]json.RawMessage, 0, len(mfs))
+	for _, mf := range mfs {
+		if nameFilter != nil && !nameFilter.MatchString(mf.GetName()) {
+			continue
+		}
+
+		b, err := marshaler.Marshal(mf)
+		if err != nil {
+			return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error marshaling metric family %q: %w", mf.GetName(), err)}, nil, nil}
+		}
+		result = append(result, json.RawMessage(b))
+	}
+
+	return apiFuncResult{result, nil, nil, nil}
+}
+
 func (api *API) serveTSDBBlocks(*http.Request) apiFuncResult {
 	blockMetas, err := api.db.BlockMetas()
 	if err != nil {
@@ -1931,6 +1984,7 @@ func (api *API) serveWALReplayStatus(w http.ResponseWriter, r *http.Request) {
 	status, err := api.db.WALReplayStatus()
 	if err != nil {
 		api.respondError(w, &apiError{errorInternal, err}, nil)
+		return
 	}
 	api.respond(w, r, walReplayStatus{
 		Min:     status.Min,
@@ -2036,7 +2090,7 @@ func (api *API) deleteSeries(r *http.Request) apiFuncResult {
 	}
 
 	for _, s := range r.Form["match[]"] {
-		matchers, err := parser.ParseMetricSelector(s)
+		matchers, err := api.parser.ParseMetricSelector(s)
 		if err != nil {
 			return invalidParamError(err, "match[]")
 		}
@@ -2245,8 +2299,8 @@ func parseDuration(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
 }
 
-func parseMatchersParam(matchers []string) ([][]*labels.Matcher, error) {
-	matcherSets, err := parser.ParseMetricSelectors(matchers)
+func (api *API) parseMatchersParam(matchers []string) ([][]*labels.Matcher, error) {
+	matcherSets, err := api.parser.ParseMetricSelectors(matchers)
 	if err != nil {
 		return nil, err
 	}

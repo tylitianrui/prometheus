@@ -47,6 +47,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/prometheus/prometheus/util/compression"
 	"github.com/prometheus/prometheus/util/features"
+	prom_runtime "github.com/prometheus/prometheus/util/runtime"
 )
 
 const (
@@ -90,6 +91,7 @@ func DefaultOptions() *Options {
 		EnableOverlappingCompaction: true,
 		EnableSharding:              false,
 		EnableDelayedCompaction:     false,
+		FloatChunkEncoding:          chunkenc.EncXOR,
 		CompactionDelayMaxPercent:   DefaultCompactionDelayMaxPercent,
 		CompactionDelay:             time.Duration(0),
 		PostingsDecoderFactory:      DefaultPostingsDecoderFactory,
@@ -125,6 +127,11 @@ type Options struct {
 	// the size of the WAL folder which is not added when calculating
 	// the current size of the database.
 	MaxBytes int64
+
+	// Maximum % of disk space to use for blocks to be retained.
+	// 0 or less means disabled.
+	// If both MaxBytes and MaxPercentage are set, percentage prevails.
+	MaxPercentage float64
 
 	// NoLockfile disables creation and consideration of a lock file.
 	NoLockfile bool
@@ -251,12 +258,26 @@ type Options struct {
 	// BlockReloadInterval is the interval at which blocks are reloaded.
 	BlockReloadInterval time.Duration
 
+	// FloatChunkEncoding is the encoding used for new float chunks when
+	// chunk_encoding.floats is absent from the configuration file.
+	// Defaults to EncXOR. Set to EncXOR2 to enable XOR2 encoding.
+	// Always use DefaultOptions() rather than a bare Options literal; the zero value
+	// of this field is EncNone, not EncXOR. This field is independent of EnableSTStorage:
+	// st-storage does not automatically select EncXOR2.
+	FloatChunkEncoding chunkenc.Encoding
+
 	// FeatureRegistry is used to register TSDB features.
 	FeatureRegistry features.Collector
 
 	// StaleSeriesCompactionThreshold is a number between 0.0-1.0 indicating the % of stale series in
 	// the in-memory Head block. If the % of stale series crosses this threshold, stale series compaction is run immediately.
 	StaleSeriesCompactionThreshold float64
+
+	// FsSizeFunc is a function returning the total disk size for a given path.
+	FsSizeFunc FsSizeFunc
+
+	// EnableFastStartup enables scraping in parallel with WAL replay but with queries still disabled.
+	EnableFastStartup bool
 }
 
 type NewCompactorFunc func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *Options) (Compactor, error)
@@ -266,6 +287,8 @@ type BlocksToDeleteFunc func(blocks []*Block) map[ulid.ULID]struct{}
 type BlockQuerierFunc func(b BlockReader, mint, maxt int64) (storage.Querier, error)
 
 type BlockChunkQuerierFunc func(b BlockReader, mint, maxt int64) (storage.ChunkQuerier, error)
+
+type FsSizeFunc func(path string) uint64
 
 // DB handles reads and writes of time series falling into
 // a hashed partition of a seriedb.
@@ -328,6 +351,8 @@ type DB struct {
 	blockQuerierFunc BlockQuerierFunc
 
 	blockChunkQuerierFunc BlockChunkQuerierFunc
+
+	fsSizeFunc FsSizeFunc
 }
 
 type dbMetrics struct {
@@ -344,6 +369,7 @@ type dbMetrics struct {
 	tombCleanTimer                  prometheus.Histogram
 	blocksBytes                     prometheus.Gauge
 	maxBytes                        prometheus.Gauge
+	maxPercentage                   prometheus.Gauge
 	retentionDuration               prometheus.Gauge
 	staleSeriesCompactionsTriggered prometheus.Counter
 	staleSeriesCompactionsFailed    prometheus.Counter
@@ -424,6 +450,10 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_retention_limit_bytes",
 		Help: "Max number of bytes to be retained in the tsdb blocks, configured 0 means disabled",
 	})
+	m.maxPercentage = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_retention_limit_percentage",
+		Help: "Max percentage of total storage space to be retained in the tsdb blocks, configured 0 means disabled",
+	})
 	m.retentionDuration = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_retention_limit_seconds",
 		Help: "How long to retain samples in storage.",
@@ -464,6 +494,7 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.tombCleanTimer,
 			m.blocksBytes,
 			m.maxBytes,
+			m.maxPercentage,
 			m.retentionDuration,
 			m.staleSeriesCompactionsTriggered,
 			m.staleSeriesCompactionsFailed,
@@ -669,6 +700,7 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 		head:                  head,
 		blockQuerierFunc:      NewBlockQuerier,
 		blockChunkQuerierFunc: NewBlockChunkQuerier,
+		fsSizeFunc:            prom_runtime.FsSize,
 	}, nil
 }
 
@@ -839,7 +871,10 @@ func (db *DBReadOnly) Close() error {
 // Open returns a new DB in the given directory. If options are empty, DefaultOptions will be used.
 func Open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, stats *DBStats) (db *DB, err error) {
 	var rngs []int64
-	opts, rngs = validateOpts(opts, nil)
+	opts, rngs, err = validateOpts(opts, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	// Register TSDB features if a registry is provided.
 	if opts.FeatureRegistry != nil {
@@ -848,14 +883,25 @@ func Open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, st
 		opts.FeatureRegistry.Set(features.TSDB, "isolation", !opts.IsolationDisabled)
 		opts.FeatureRegistry.Set(features.TSDB, "use_uncached_io", opts.UseUncachedIO)
 		opts.FeatureRegistry.Enable(features.TSDB, "native_histograms")
+		opts.FeatureRegistry.Set(features.TSDB, "st_storage", opts.EnableSTStorage)
+		opts.FeatureRegistry.Set(features.TSDB, "xor2_encoding", opts.FloatChunkEncoding == chunkenc.EncXOR2)
 	}
 
 	return open(dir, l, r, opts, rngs, stats)
 }
 
-func validateOpts(opts *Options, rngs []int64) (*Options, []int64) {
+func validateOpts(opts *Options, rngs []int64) (*Options, []int64, error) {
 	if opts == nil {
 		opts = DefaultOptions()
+	}
+	if opts.FloatChunkEncoding == chunkenc.EncNone {
+		opts.FloatChunkEncoding = chunkenc.EncXOR
+	}
+	if opts.FloatChunkEncoding != chunkenc.EncXOR && opts.FloatChunkEncoding != chunkenc.EncXOR2 {
+		return nil, nil, fmt.Errorf("unsupported float chunk encoding %q; valid values are %q and %q", strings.ToLower(opts.FloatChunkEncoding.String()), config.FloatChunkEncodingXOR, config.FloatChunkEncodingXOR2)
+	}
+	if opts.EnableSTStorage && opts.FloatChunkEncoding == chunkenc.EncXOR {
+		return nil, nil, fmt.Errorf("float chunk encoding %q is incompatible with start-timestamp storage; XOR chunks do not store start timestamps, use %q", config.FloatChunkEncodingXOR, config.FloatChunkEncodingXOR2)
 	}
 	if opts.StripeSize <= 0 {
 		opts.StripeSize = DefaultStripeSize
@@ -895,7 +941,7 @@ func validateOpts(opts *Options, rngs []int64) (*Options, []int64) {
 	}
 
 	opts.staleSeriesCompactionThreshold.Store(opts.StaleSeriesCompactionThreshold)
-	return opts, rngs
+	return opts, rngs, nil
 }
 
 // open returns a new DB in the given directory.
@@ -929,8 +975,12 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 
 	for _, tmpDir := range []string{walDir, dir} {
 		// Remove tmp dirs.
-		if err := removeBestEffortTmpDirs(l, tmpDir); err != nil {
+		if err := tsdbutil.RemoveTmpDirs(l, tmpDir, isTmpDir); err != nil {
 			return nil, fmt.Errorf("remove tmp dirs: %w", err)
+		}
+		// Remove any temporary checkpoints that might have been interrupted during creation.
+		if err := wlog.DeleteTempCheckpoints(l, tmpDir); err != nil {
+			return nil, fmt.Errorf("delete temp checkpoints: %w", err)
 		}
 	}
 
@@ -1003,6 +1053,12 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 		db.blockChunkQuerierFunc = opts.BlockChunkQuerierFunc
 	}
 
+	if opts.FsSizeFunc == nil {
+		db.fsSizeFunc = prom_runtime.FsSize
+	} else {
+		db.fsSizeFunc = opts.FsSizeFunc
+	}
+
 	var wal, wbl *wlog.WL
 	segmentSize := wlog.DefaultSegmentSize
 	// Wal is enabled.
@@ -1044,7 +1100,10 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	headOpts.OutOfOrderCapMax.Store(opts.OutOfOrderCapMax)
 	headOpts.EnableSharding = opts.EnableSharding
 	headOpts.EnableSTAsZeroSample = opts.EnableSTAsZeroSample
+	headOpts.EnableSTStorage.Store(opts.EnableSTStorage)
+	headOpts.FloatChunkEncoding.Store(uint32(opts.FloatChunkEncoding))
 	headOpts.EnableMetadataWALRecords = opts.EnableMetadataWALRecords
+	headOpts.EnableFastStartup = opts.EnableFastStartup
 	if opts.WALReplayConcurrency > 0 {
 		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
 	}
@@ -1062,6 +1121,7 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	db.metrics = newDBMetrics(db, r)
 	maxBytes := max(opts.MaxBytes, 0)
 	db.metrics.maxBytes.Set(float64(maxBytes))
+	db.metrics.maxPercentage.Set(max(opts.MaxPercentage, 0))
 	db.metrics.retentionDuration.Set((time.Duration(opts.RetentionDuration) * time.Millisecond).Seconds())
 
 	// Calling db.reload() calls db.reloadBlocks() which requires cmtx to be locked.
@@ -1113,26 +1173,6 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	go db.run(ctx)
 
 	return db, nil
-}
-
-func removeBestEffortTmpDirs(l *slog.Logger, dir string) error {
-	files, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	for _, f := range files {
-		if isTmpDir(f) {
-			if err := os.RemoveAll(filepath.Join(dir, f.Name())); err != nil {
-				l.Error("failed to delete tmp block dir", "dir", filepath.Join(dir, f.Name()), "err", err)
-				continue
-			}
-			l.Info("Found and deleted tmp block dir", "dir", filepath.Join(dir, f.Name()))
-		}
-	}
-	return nil
 }
 
 // StartTime implements the Storage interface.
@@ -1261,23 +1301,40 @@ func (db *DB) AppenderV2(ctx context.Context) storage.AppenderV2 {
 func (db *DB) ApplyConfig(conf *config.Config) error {
 	oooTimeWindow := int64(0)
 	if conf.StorageConfig.TSDBConfig != nil {
+		// Validate encoding config before updating the head encoding so that
+		// an invalid encoding in the config does not change the active encoding.
+		if conf.StorageConfig.TSDBConfig.ChunkEncoding.Floats == config.FloatChunkEncodingXOR2 && db.opts.FloatChunkEncoding != chunkenc.EncXOR2 {
+			return errors.New("'storage.tsdb.chunk_encoding.floats: xor2' requires the xor2-encoding feature flag to be enabled at startup")
+		}
+		// db.opts.EnableSTStorage is set once at startup and never mutated.
+		if conf.StorageConfig.TSDBConfig.ChunkEncoding.Floats == config.FloatChunkEncodingXOR && db.opts.EnableSTStorage {
+			return errors.New("'storage.tsdb.chunk_encoding.floats: xor' is incompatible with st-storage; XOR chunks do not store start timestamps")
+		}
 		oooTimeWindow = conf.StorageConfig.TSDBConfig.OutOfOrderTimeWindow
 		db.opts.staleSeriesCompactionThreshold.Store(conf.StorageConfig.TSDBConfig.StaleSeriesCompactionThreshold)
 		// Update retention configuration if provided.
 		if conf.StorageConfig.TSDBConfig.Retention != nil {
 			db.retentionMtx.Lock()
-			if conf.StorageConfig.TSDBConfig.Retention.Time > 0 {
-				db.opts.RetentionDuration = int64(conf.StorageConfig.TSDBConfig.Retention.Time)
-				db.metrics.retentionDuration.Set((time.Duration(db.opts.RetentionDuration) * time.Millisecond).Seconds())
-			}
-			if conf.StorageConfig.TSDBConfig.Retention.Size > 0 {
-				db.opts.MaxBytes = int64(conf.StorageConfig.TSDBConfig.Retention.Size)
-				db.metrics.maxBytes.Set(float64(db.opts.MaxBytes))
-			}
+			db.opts.RetentionDuration = int64(time.Duration(conf.StorageConfig.TSDBConfig.Retention.Time) / time.Millisecond)
+			db.metrics.retentionDuration.Set((time.Duration(db.opts.RetentionDuration) * time.Millisecond).Seconds())
+			db.opts.MaxBytes = int64(conf.StorageConfig.TSDBConfig.Retention.Size)
+			db.metrics.maxBytes.Set(float64(db.opts.MaxBytes))
+			db.opts.MaxPercentage = conf.StorageConfig.TSDBConfig.Retention.Percentage
+			db.metrics.maxPercentage.Set(db.opts.MaxPercentage)
 			db.retentionMtx.Unlock()
 		}
+		// Default to the startup encoding; overridden by an explicit value below.
+		effectiveEncoding := db.opts.FloatChunkEncoding
+		switch conf.StorageConfig.TSDBConfig.ChunkEncoding.Floats {
+		case config.FloatChunkEncodingXOR:
+			effectiveEncoding = chunkenc.EncXOR
+		case config.FloatChunkEncodingXOR2:
+			effectiveEncoding = chunkenc.EncXOR2
+		}
+		db.head.opts.FloatChunkEncoding.Store(uint32(effectiveEncoding))
 	} else {
 		db.opts.staleSeriesCompactionThreshold.Store(0)
+		db.head.opts.FloatChunkEncoding.Store(uint32(db.opts.FloatChunkEncoding))
 	}
 	if oooTimeWindow < 0 {
 		oooTimeWindow = 0
@@ -1319,11 +1376,11 @@ func (db *DB) getRetentionDuration() int64 {
 	return db.opts.RetentionDuration
 }
 
-// getMaxBytes returns the current max bytes setting in a thread-safe manner.
-func (db *DB) getMaxBytes() int64 {
+// getRetentionSettings returns max bytes and max percentage settings in a thread-safe manner.
+func (db *DB) getRetentionSettings() (int64, float64) {
 	db.retentionMtx.RLock()
 	defer db.retentionMtx.RUnlock()
-	return db.opts.MaxBytes
+	return db.opts.MaxBytes, db.opts.MaxPercentage
 }
 
 // dbAppender wraps the DB's head appender and triggers compactions on commit
@@ -1662,14 +1719,14 @@ func (db *DB) CompactStaleHead() (err error) {
 
 	// We get the stale series reference first because this list can change during the compaction below.
 	// It is more efficient and easier to provide an index interface for the stale series when we have a static list.
-	staleSeriesRefs, err := db.head.SortedStaleSeriesRefsNoOOOData(context.Background())
+	staleSeriesRefs, err := db.head.staleSeriesRefsNoOOOData(context.Background())
 	if err != nil {
 		return err
 	}
 	meta := &BlockMeta{}
 	meta.Compaction.SetStaleSeries()
 	mint, maxt := db.head.opts.ChunkRange*(db.head.MinTime()/db.head.opts.ChunkRange), db.head.MaxTime()
-	for ; mint < maxt; mint += db.head.chunkRange.Load() {
+	for ; mint <= maxt; mint += db.head.chunkRange.Load() {
 		staleHead := NewStaleHead(db.Head(), mint, mint+db.head.chunkRange.Load()-1, staleSeriesRefs)
 
 		uids, err := db.compactor.Write(db.dir, staleHead, staleHead.MinTime(), staleHead.BlockMaxTime(), meta)
@@ -1690,14 +1747,14 @@ func (db *DB) CompactStaleHead() (err error) {
 		}
 	}
 
-	if err := db.head.truncateStaleSeries(staleSeriesRefs, maxt); err != nil {
+	if err := db.head.truncateStaleSeries(staleSeriesRefs.sortedByRef, maxt); err != nil {
 		return fmt.Errorf("head truncate: %w", err)
 	}
 	db.head.RebuildSymbolTable(db.logger)
 
 	elapsed := time.Since(start)
 	db.metrics.staleSeriesCompactionDuration.Observe(elapsed.Seconds())
-	db.logger.Info("Ending stale series compaction", "num_series", len(staleSeriesRefs), "duration", elapsed)
+	db.logger.Info("Ending stale series compaction", "num_series", len(staleSeriesRefs.sortedByRef), "duration", elapsed)
 	return nil
 }
 
@@ -1983,9 +2040,25 @@ func BeyondTimeRetention(db *DB, blocks []*Block) (deletable map[ulid.ULID]struc
 // BeyondSizeRetention returns those blocks which are beyond the size retention
 // set in the db options.
 func BeyondSizeRetention(db *DB, blocks []*Block) (deletable map[ulid.ULID]struct{}) {
-	// Size retention is disabled or no blocks to work with.
-	maxBytes := db.getMaxBytes()
-	if len(blocks) == 0 || maxBytes <= 0 {
+	// No blocks to work with
+	if len(blocks) == 0 {
+		return deletable
+	}
+
+	maxBytes, maxPercentage := db.getRetentionSettings()
+
+	// Max percentage prevails over max size.
+	if maxPercentage > 0 {
+		diskSize := db.fsSizeFunc(db.dir)
+		if diskSize <= 0 {
+			db.logger.Warn("Unable to retrieve filesystem size of database directory, skip percentage limitation and default to fixed size limitation", "dir", db.dir)
+		} else {
+			maxBytes = int64(float64(diskSize) * maxPercentage / 100)
+		}
+	}
+
+	// Size retention is disabled.
+	if maxBytes <= 0 {
 		return deletable
 	}
 
@@ -2538,8 +2611,7 @@ func isBlockDir(fi fs.DirEntry) bool {
 	return err == nil
 }
 
-// isTmpDir returns true if the given file-info contains a block ULID, a checkpoint prefix,
-// or a chunk snapshot prefix and a tmp extension.
+// isTmpDir returns true if the given file-info contains a block ULID, or a chunk snapshot prefix and a tmp extension.
 func isTmpDir(fi fs.DirEntry) bool {
 	if !fi.IsDir() {
 		return false
@@ -2548,9 +2620,6 @@ func isTmpDir(fi fs.DirEntry) bool {
 	fn := fi.Name()
 	ext := filepath.Ext(fn)
 	if ext == tmpForDeletionBlockDirSuffix || ext == tmpForCreationBlockDirSuffix || ext == tmpLegacy {
-		if strings.HasPrefix(fn, wlog.CheckpointPrefix) {
-			return true
-		}
 		if strings.HasPrefix(fn, chunkSnapshotPrefix) {
 			return true
 		}

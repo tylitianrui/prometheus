@@ -225,7 +225,8 @@ func (h *writeHandler) appendV1Samples(app storage.Appender, ss []prompb.Sample,
 		if err != nil {
 			if errors.Is(err, storage.ErrOutOfOrderSample) ||
 				errors.Is(err, storage.ErrOutOfBounds) ||
-				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) {
+				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
+				errors.Is(err, storage.ErrTooOldSample) {
 				h.logger.Error("Out of order sample from remote write", "err", err.Error(), "series", labels.String(), "timestamp", s.Timestamp)
 			}
 			return err
@@ -247,7 +248,8 @@ func (h *writeHandler) appendV1Histograms(app storage.Appender, hh []prompb.Hist
 			// a note indicating its inclusion in the future.
 			if errors.Is(err, storage.ErrOutOfOrderSample) ||
 				errors.Is(err, storage.ErrOutOfBounds) ||
-				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) {
+				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
+				errors.Is(err, storage.ErrTooOldSample) {
 				h.logger.Error("Out of order histogram from remote write", "err", err.Error(), "series", labels.String(), "timestamp", hp.Timestamp)
 			}
 			return err
@@ -317,7 +319,11 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 			continue
 		}
 
-		m := ts.ToMetadata(req.Symbols)
+		m, err := ts.ToMetadata(req.Symbols)
+		if err != nil {
+			badRequestErrs = append(badRequestErrs, fmt.Errorf("parsing metadata for series %v: %w", ts.LabelsRefs, err))
+			continue
+		}
 		if h.enableTypeAndUnitLabels && (m.Type != model.MetricTypeUnknown || m.Unit != "") {
 			slb := labels.NewScratchBuilder(ls.Len() + 2) // +2 for __type__ and __unit__
 			ls.Range(func(l labels.Label) {
@@ -409,7 +415,8 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 			// a note indicating its inclusion in the future.
 			if errors.Is(err, storage.ErrOutOfOrderSample) ||
 				errors.Is(err, storage.ErrOutOfBounds) ||
-				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) {
+				errors.Is(err, storage.ErrDuplicateSampleForTimestamp) ||
+				errors.Is(err, storage.ErrTooOldSample) {
 				// TODO(bwplotka): Not too spammy log?
 				h.logger.Error("Out of order histogram from remote write", "err", err.Error(), "series", ls.String(), "timestamp", hp.Timestamp)
 				badRequestErrs = append(badRequestErrs, fmt.Errorf("%w for series %v", err, ls.String()))
@@ -443,7 +450,7 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 				continue
 			}
 			// TODO(bwplotka): Add strict mode which would trigger rollback of everything if needed.
-			// For now we keep the previously released flow (just error not debug leve) of dropping them without rollback and 5xx.
+			// For now we keep the previously released flow (just error not debug level) of dropping them without rollback and 5xx.
 			h.logger.Error("failed to ingest exemplar, emitting error log, but no error for PRW caller", "err", err.Error(), "series", ls.String(), "exemplar", fmt.Sprintf("%+v", e))
 		}
 

@@ -26,7 +26,6 @@ import (
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
-	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
@@ -76,6 +75,7 @@ type LightsailSDConfig struct {
 	SecretKey       config.Secret  `yaml:"secret_key,omitempty"`
 	Profile         string         `yaml:"profile,omitempty"`
 	RoleARN         string         `yaml:"role_arn,omitempty"`
+	ExternalID      string         `yaml:"external_id,omitempty"`
 	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
 	Port            int            `yaml:"port"`
 
@@ -97,6 +97,11 @@ func (c *LightsailSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (dis
 	return NewLightsailDiscovery(c, opts)
 }
 
+// SetDirectory joins any relative file paths with dir.
+func (c *LightsailSDConfig) SetDirectory(dir string) {
+	c.HTTPClientConfig.SetDirectory(dir)
+}
+
 // UnmarshalYAML implements the yaml.Unmarshaler interface for the Lightsail Config.
 func (c *LightsailSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	*c = DefaultLightsailSDConfig
@@ -106,33 +111,29 @@ func (c *LightsailSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
 		return err
 	}
 
-	if c.Region == "" {
-		cfg, err := awsConfig.LoadDefaultConfig(context.Background())
-		if err != nil {
-			return err
-		}
-
-		if cfg.Region != "" {
-			// Use the region from the AWS config. It will load environment variables and shared config files.
-			c.Region = cfg.Region
-		}
-
-		if c.Region == "" {
-			// Try to get the region from the instance metadata service (IMDS).
-			imdsClient := imds.NewFromConfig(cfg)
-			region, err := imdsClient.GetRegion(context.Background(), &imds.GetRegionInput{})
-			if err != nil {
-				return err
-			}
-			c.Region = region.Region
-		}
-	}
-
-	if c.Region == "" {
-		return errors.New("lightsail SD configuration requires a region")
+	c.Region, err = loadRegion(context.Background(), c.Region)
+	if err != nil {
+		return fmt.Errorf("could not determine AWS region: %w", err)
 	}
 
 	return c.HTTPClientConfig.Validate()
+}
+
+// lightsailClientAdapter captures only the Lightsail API calls AWS discovery
+// uses as method-value closures, keeping the concrete *lightsail.Client out of
+// any interface-boxed struct field. See ec2ClientAdapter for the full
+// rationale: this stops the linker from retaining the entire Lightsail API
+// surface (~3.4 MB).
+type lightsailClientAdapter struct {
+	getInstances func(ctx context.Context, params *lightsail.GetInstancesInput, optFns ...func(*lightsail.Options)) (*lightsail.GetInstancesOutput, error)
+}
+
+func newLightsailClientAdapter(c *lightsail.Client) *lightsailClientAdapter {
+	return &lightsailClientAdapter{getInstances: c.GetInstances}
+}
+
+func (a *lightsailClientAdapter) GetInstances(ctx context.Context, params *lightsail.GetInstancesInput, optFns ...func(*lightsail.Options)) (*lightsail.GetInstancesOutput, error) {
+	return a.getInstances(ctx, params, optFns...)
 }
 
 // LightsailDiscovery periodically performs Lightsail-SD requests. It implements
@@ -140,7 +141,7 @@ func (c *LightsailSDConfig) UnmarshalYAML(unmarshal func(any) error) error {
 type LightsailDiscovery struct {
 	*refresh.Discovery
 	cfg       *LightsailSDConfig
-	lightsail *lightsail.Client
+	lightsail *lightsailClientAdapter
 }
 
 // NewLightsailDiscovery returns a new LightsailDiscovery which periodically refreshes its targets.
@@ -170,7 +171,7 @@ func NewLightsailDiscovery(conf *LightsailSDConfig, opts discovery.DiscovererOpt
 	return d, nil
 }
 
-func (d *LightsailDiscovery) lightsailClient(ctx context.Context) (*lightsail.Client, error) {
+func (d *LightsailDiscovery) lightsailClient(ctx context.Context) (*lightsailClientAdapter, error) {
 	if d.lightsail != nil {
 		return d.lightsail, nil
 	}
@@ -206,11 +207,20 @@ func (d *LightsailDiscovery) lightsailClient(ctx context.Context) (*lightsail.Cl
 
 	// If the role ARN is set, assume the role to get credentials and set the credentials provider in the config.
 	if d.cfg.RoleARN != "" {
-		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN)
+		assumeProvider := stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), d.cfg.RoleARN, func(o *stscreds.AssumeRoleOptions) {
+			if d.cfg.ExternalID != "" {
+				o.ExternalID = aws.String(d.cfg.ExternalID)
+			}
+		})
 		cfg.Credentials = aws.NewCredentialsCache(assumeProvider)
 	}
 
-	d.lightsail = lightsail.NewFromConfig(cfg)
+	d.lightsail = newLightsailClientAdapter(lightsail.NewFromConfig(cfg, func(options *lightsail.Options) {
+		if d.cfg.Endpoint != "" {
+			options.BaseEndpoint = &d.cfg.Endpoint
+		}
+		options.HTTPClient = httpClient
+	}))
 
 	return d.lightsail, nil
 }
